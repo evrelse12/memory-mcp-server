@@ -1,0 +1,29 @@
+# Виртуальное окружение Python
+venv/
+.venv/
+
+# База данных (содержит личную память!)
+db/
+bd/
+*.db
+*.db-wal
+*.db-shm
+
+# Конфигурации с секретными ключами
+.env
+.env.local
+
+# Логи
+logs/
+*.log
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Системные файлы
+.DS_Store
+.idea/
+.vscode/
