@@ -27,3 +27,6 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Доп файлы
+intent_cache.json

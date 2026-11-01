@@ -1,2 +1,1 @@
-from .consolidator import Consolidator
-from .maintenance import MaintenanceService
+# package marker only; import modules by full path

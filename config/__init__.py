@@ -1,1 +1,1 @@
-from .settings import settings
+# package marker only; import modules by full path

@@ -1,0 +1,35 @@
+[project]
+name = "memory-mcp"
+version = "0.3.0"
+description = "Long-term memory MCP server: knowledge graph, hybrid search, Ebbinghaus decay"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=2.14",
+    "mcp>=1.9,<2.0",
+    "aiosqlite>=0.19",
+    "sqlite-vec>=0.1.6",
+    "httpx>=0.27",
+    "pydantic>=2.5",
+    "pydantic-settings>=2.1",
+    "starlette>=0.37",
+    "APScheduler>=3.10",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["config", "core", "services", "agents", "tools", "mcp_server"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
