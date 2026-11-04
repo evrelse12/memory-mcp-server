@@ -45,7 +45,3 @@ get_entity_info, get_timeline, memory_stats, explain_fact, weak_facts.
 ## Tests
 
     pytest -q
-
-## Migration from v1
-
-    python scripts/migrate_v1_to_v2.py /path/to/old/memory.db

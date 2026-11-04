@@ -19,7 +19,6 @@ class Settings(BaseSettings):
     data_dir: Path = Field(default=Path.home() / "memory")
     db_path: Path | None = None
     log_path: Path | None = None
-    cache_dir: Path | None = None
 
     # --- LLM / embedding endpoints ---
     llm_api_url: str = "http://127.0.0.1:9931"
@@ -36,10 +35,6 @@ class Settings(BaseSettings):
     embedding_document_prefix: str = "search_document: "
     embedding_truncate_matryoshka: bool = True
 
-    # --- Daemon ---
-    daemon_host: str = "127.0.0.1"
-    daemon_port: int = Field(default=9932, ge=1, le=65535)
-
     # --- Memory behaviour ---
     session_timeout_minutes: int = Field(default=30, ge=1)
     consolidation_cron_hour: int = Field(default=3, ge=0, le=23)
@@ -47,7 +42,8 @@ class Settings(BaseSettings):
     consolidation_chunk_chars: int = Field(default=6000, ge=500)
     max_facts_per_llm_call: int = Field(default=12, ge=1, le=50)
     conflict_band_min: float = Field(default=0.80, ge=0.0, lt=1.0)
-    episode_retention_days: int = Field(default=0, ge=0)  # 0 = keep forever
+    episode_retention_days: int = Field(default=0, ge=0)
+    soft_delete_retention_days: int = Field(default=30, ge=1)  # audit grace period
     max_episode_chars: int = Field(default=4000, ge=100)
 
     default_decay_rate: float = Field(default=0.1, ge=0.0, le=1.0)
@@ -60,12 +56,13 @@ class Settings(BaseSettings):
     rrf_weight_graph: float = Field(default=1.0, ge=0.0)
     max_search_limit: int = Field(default=50, ge=1, le=200)
     dedup_similarity_threshold: float = Field(default=0.92, gt=0.0, lt=1.0)
+
+    causal_user_only: bool = True
     causal_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
-    max_causal_pairs: int = Field(default=50, ge=1, le=500)
+    max_causal_pairs: int = Field(default=10, ge=1, le=200)
 
     log_level: str = "INFO"
 
-    # --- Derived paths ---
     @property
     def db_file(self) -> Path:
         return self.db_path or (self.data_dir / "db" / "memory.db")
@@ -73,10 +70,6 @@ class Settings(BaseSettings):
     @property
     def log_file(self) -> Path:
         return self.log_path or (self.data_dir / "logs" / "memory.log")
-
-    @property
-    def intent_cache_file(self) -> Path:
-        return (self.cache_dir or (self.data_dir / "cache")) / "intent_cache.json"
 
     @field_validator("log_level")
     @classmethod

@@ -1,28 +1,28 @@
 # mcp_server/server.py
-"""Memory MCP server using FastMCP 3.x."""
+"""Memory MCP server (stdio only). Graceful shutdown; short model instructions."""
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import signal
 import sys
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
 from typing import Annotated, Literal, Optional
 
-# ИМПОРТЫ ДЛЯ FASTMCP
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from agents.consolidator import Consolidator
 from agents.maintenance import MaintenanceService
 from config.settings import settings
 from core.database import Database
 from core.storage import Storage
+from core.tasks import drain as drain_tasks
 from core.write_queue import WriteQueue
 from services.decay import DecayService
 from services.embedding import EmbeddingService
@@ -33,33 +33,14 @@ from tools.memory_tools import MemoryTools, MemoryToolError
 
 logger = logging.getLogger(__name__)
 
-MCP_TRANSPORT = os.environ.get("MEMORY_MCP_TRANSPORT", "stdio")
+# Short on purpose: small models follow few crisp rules better than long essays.
+SERVER_INSTRUCTIONS = (
+    "You have persistent long-term memory. Every turn: first call record_message "
+    "with the user's exact text. Before answering about the user, people, projects "
+    "or the past, call search_memory. Store durable facts with remember_fact; "
+    "replace contradictions with correct_fact; pin with confirm_fact; delete with "
+    "forget_fact. Never guess from context alone.")
 
-SERVER_INSTRUCTIONS = """
-You have persistent long-term memory with automatic fact extraction.
-
-CRITICAL RULES — follow EVERY turn:
-
-1. **ALWAYS search first**: Before answering about user, people, projects, past events, preferences, or prior decisions: call search_memory. NEVER guess from context alone.
-
-2. **ALWAYS remember facts**: When user states ANY durable information (name, role, preference, project, deadline, opinion, relationship, location, skill, goal), IMMEDIATELY call remember_fact in the SAME turn. Examples:
-   - User: "I work at Google" → call remember_fact(content="User works at Google", node_type="semantic")
-   - User: "I prefer dark theme" → call remember_fact(content="User prefers dark theme", node_type="opinion")
-   - User: "My birthday is March 15" → call remember_fact(content="User birthday is March 15", node_type="semantic")
-   - User: "I'm learning Python" → call remember_fact(content="User is learning Python", node_type="procedural")
-
-3. **ALWAYS correct contradictions**: When new info contradicts stored fact: call correct_fact (NEVER remember_fact for corrections).
-
-4. **ALWAYS confirm when asked**: When user explicitly confirms fact as permanent: call confirm_fact.
-
-5. **ALWAYS forget when asked**: When user says "forget", "delete", "remove": call forget_fact.
-
-6. **Use tool results naturally**: Never dump raw JSON to user. Integrate memory into your reply.
-
-7. **If memory fails**: Say memory is unavailable and continue without it.
-
-You are proactive: extract facts from EVERY user message, not just explicit commands.
-"""
 
 @dataclass
 class AppContext:
@@ -81,7 +62,6 @@ class AppContext:
 ctx: Optional[AppContext] = None
 
 
-# ------------------------------------------------------------ lifecycle
 async def build_context() -> AppContext:
     db = Database()
     await db.initialize()
@@ -98,7 +78,8 @@ async def build_context() -> AppContext:
     search = SearchService(storage, embedding, entity_index)
     decay = DecayService(storage)
     consolidator = Consolidator(storage, embedding, entity_index)
-    maintenance = MaintenanceService(storage, consolidator, decay, embedding, entity_index)
+    maintenance = MaintenanceService(storage, consolidator, decay, embedding,
+                                     entity_index)
     tools = MemoryTools(storage, search, embedding, entity_index, decay)
 
     scheduler = AsyncIOScheduler()
@@ -109,46 +90,69 @@ async def build_context() -> AppContext:
     scheduler.start()
 
     app = AppContext(db, queue, storage, embedding, entity_index, hot_path,
-                     search, decay, consolidator, maintenance, tools, scheduler)
-    await maintenance.run_if_overdue()
+                     search, decay, consolidator, maintenance, tools, scheduler,
+                     session_id=uuid.uuid4().hex[:12])
+    await maintenance.run_if_overdue()   # spawns catch-up task via registry
     return app
 
-
 async def teardown(app: Optional[AppContext]) -> None:
+    """Stop all background tasks and close resources with per-step timeouts."""
     if app is None:
         return
+    
+    # 1. Stop scheduler (no wait)
     if app.scheduler:
-        app.scheduler.shutdown(wait=False)
-    await app.queue.stop(timeout=5)
-    await app.embedding.close()
-    await app.consolidator.close()
-    await app.db.close()
+        try:
+            app.scheduler.shutdown(wait=False)
+        except Exception:
+            pass
+    
+    # 2. Drain background tasks (catch-up maintenance, embeddings)
+    try:
+        await asyncio.wait_for(drain_tasks(timeout=3), timeout=5)
+    except (asyncio.TimeoutError, Exception):
+        pass
+    
+    # 3. Stop WriteQueue (flush pending ops)
+    try:
+        await asyncio.wait_for(app.queue.stop(timeout=3), timeout=5)
+    except (asyncio.TimeoutError, Exception):
+        pass
+    
+    # 4. Optimize DB
+    try:
+        await asyncio.wait_for(app.storage.raw("PRAGMA optimize"), timeout=2)
+    except (asyncio.TimeoutError, Exception):
+        pass
+    
+    # 5. Close services
+    for svc in (app.embedding, app.consolidator, app.db):
+        try:
+            await asyncio.wait_for(svc.close(), timeout=2)
+        except (asyncio.TimeoutError, Exception):
+            pass
 
 
-async def _emergency_drain(sig: int) -> None:
-    logger.warning("signal %s: draining write queue", sig)
+async def _graceful_shutdown(sig: int) -> None:
+    """Drain the queue and run teardown (no loop.stop — breaks pytest)."""
+    global ctx
+    logger.warning("signal %s: shutting down gracefully", sig)
     if ctx:
         try:
-            await asyncio.wait_for(ctx.queue.stop(timeout=5), 6)
+            await asyncio.wait_for(teardown(ctx), timeout=10)
         except Exception:
-            logger.exception("drain failed")
-    os._exit(0)
-
+            logger.exception("teardown failed")
+        ctx = None
 
 @asynccontextmanager
 async def lifespan(server):
     global ctx
-    try:
-        ctx = await build_context()
-    except Exception:
-        logger.exception("build_context failed")
-        ctx = None
-        raise
+    ctx = await build_context()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig,
-                                    lambda s=sig: asyncio.ensure_future(_emergency_drain(s)))
+            loop.add_signal_handler(
+                sig, lambda s=sig: asyncio.ensure_future(_graceful_shutdown(s)))
         except (NotImplementedError, RuntimeError):
             pass
     try:
@@ -161,7 +165,6 @@ async def lifespan(server):
 mcp = FastMCP("memory-server", instructions=SERVER_INSTRUCTIONS, lifespan=lifespan)
 
 
-# ------------------------------------------------------------ error mapping
 def tool_errors(fn):
     @wraps(fn)
     async def wrapper(*args, **kwargs):
@@ -175,7 +178,19 @@ def tool_errors(fn):
     return wrapper
 
 
-# ------------------------------------------------------------ tools
+@mcp.tool()
+@tool_errors
+async def record_message(
+    message: Annotated[str, Field(max_length=4000,
+        description="The user's exact raw message for this turn")],
+    role: Literal["user", "assistant"] = "user",
+) -> dict:
+    """Record a dialogue message as an episode. Call FIRST every turn."""
+    session = ctx.session_id or "default"
+    episode_id = await ctx.hot_path.record_message(session, message, role=role)
+    return {"status": "recorded", "episode_id": episode_id}
+
+
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def search_memory(
@@ -185,33 +200,27 @@ async def search_memory(
         Field(description="Filter node types; omit for facts only")] = None,
     limit: Annotated[int, Field(ge=1, le=50)] = 10,
 ) -> list[dict]:
-    """Search long-term memory. ALWAYS call before answering about user, people, projects, past events, preferences."""
+    """Search long-term memory before answering about user, people, projects, past."""
     return await ctx.tools.search_memory(query, node_types=node_types, limit=limit)
+
 
 @mcp.tool()
 @tool_errors
 async def remember_fact(
-    content: Annotated[str, Field(max_length=1000, description="Self-contained sentence, explicit names, no pronouns")],
+    content: Annotated[str, Field(max_length=1000,
+        description="Self-contained sentence, explicit names, no pronouns")],
     node_type: Literal["semantic", "procedural", "opinion"] = "semantic",
     confidence: Annotated[float, Field(ge=0, le=1)] = 0.9,
-    entities: Annotated[Optional[list[str]], Field(description="Entity names mentioned")] = None,
+    entities: Annotated[Optional[list[str]],
+        Field(description="Entity names; auto-extracted when omitted")] = None,
     pin: Annotated[bool, Field(description="Protect from forgetting")] = False,
-    auto_extract_entities: Annotated[bool, Field(description="Auto-extract entities from content if not provided")] = True,
 ) -> dict:
-    """Store a new fact. Call when user states name, role, preference, project, deadline, opinion."""
-    ep = ctx.hot_path.last_episode(ctx.session_id or "") if ctx else ""
-    
-    if isinstance(entities, str):
-        entities = [entities] if entities.strip() else None
-    
-    # Автоизвлечение: если entities не переданы, берём все существующие сущности, упомянутые в content
-    if not entities and auto_extract_entities:
-        found = ctx.entity_index.find_in_text(content)
-        entities = [name for name, _ in found] if found else None
-    
+    """Store a durable fact stated by the user (name, role, preference, project)."""
+    ep = await ctx.storage.last_episode_id(ctx.session_id or "default")
     return await ctx.tools.remember_fact(
         content, node_type=node_type, confidence=confidence, entities=entities,
         pin=pin, source_episode_ids=[ep] if ep else ())
+
 
 @mcp.tool(annotations={"destructiveHint": True})
 @tool_errors
@@ -221,8 +230,8 @@ async def correct_fact(
         description="Replacement sentence, self-contained")],
     new_confidence: Annotated[float, Field(ge=0, le=1)] = 0.9,
 ) -> dict:
-    """Replace outdated fact. Use when new info contradicts stored fact."""
-    ep = ctx.hot_path.last_episode(ctx.session_id or "")
+    """Replace an outdated fact when new info contradicts it."""
+    ep = await ctx.storage.last_episode_id(ctx.session_id or "default")
     return await ctx.tools.correct_fact(
         old_node_id, new_content, new_confidence=new_confidence,
         source_episode_ids=[ep] if ep else ())
@@ -233,7 +242,7 @@ async def correct_fact(
 async def confirm_fact(
     node_id: Annotated[str, Field(description="Id of an existing fact")],
 ) -> dict:
-    """Pin fact permanently (confidence=1.0, no decay)."""
+    """Pin a fact permanently (confidence=1.0, no decay)."""
     return await ctx.tools.confirm_fact(node_id)
 
 
@@ -241,33 +250,30 @@ async def confirm_fact(
 @tool_errors
 async def forget_fact(
     node_id: Annotated[str, Field(description="Id of the fact to remove")],
-    hard: Annotated[bool,
-        Field(description="Physically delete instead of soft-delete")] = False,
+    hard: Annotated[bool, Field(description="Physically delete")] = False,
 ) -> dict:
-    """Remove fact from memory. Use when user says 'forget' or 'delete'."""
+    """Remove a fact (soft by default, hard on request)."""
     return await ctx.tools.forget_fact(node_id, hard=hard)
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def get_entity_info(
-    entity_name: Annotated[str,
-        Field(description="Person/project/tool name as the user says it")],
+    entity_name: Annotated[str, Field(description="Person/project/tool name")],
 ) -> dict:
-    """Get full profile of named entity: summary, aliases, linked facts."""
+    """Entity profile: summary, aliases, linked facts."""
     return await ctx.tools.get_entity_info(entity_name)
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def get_timeline(
-    entity_name: Annotated[Optional[str],
-        Field(description="Focus on one entity")] = None,
+    entity_name: Annotated[Optional[str], Field(description="One entity")] = None,
     time_from: Annotated[Optional[int], Field(description="Unix ts start")] = None,
     time_to: Annotated[Optional[int], Field(description="Unix ts end")] = None,
     limit: Annotated[int, Field(ge=1, le=50)] = 20,
 ) -> list[dict]:
-    """Get chronological dialogue episodes, filtered by entity or time."""
+    """Chronological dialogue episodes."""
     return await ctx.tools.get_timeline(entity_name=entity_name,
                                         time_from=time_from, time_to=time_to,
                                         limit=limit)
@@ -276,7 +282,7 @@ async def get_timeline(
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def memory_stats() -> dict:
-    """Get memory graph metrics: node/edge/entity counts, DB size."""
+    """Graph metrics and DB size."""
     return await ctx.tools.memory_stats()
 
 
@@ -285,7 +291,7 @@ async def memory_stats() -> dict:
 async def explain_fact(
     node_id: Annotated[str, Field(description="Id of the fact to justify")],
 ) -> dict:
-    """Get provenance: source episodes, supersedes chain, linked entities."""
+    """Provenance: source episodes, supersedes chain, entities."""
     return await ctx.tools.explain_fact(node_id)
 
 
@@ -294,35 +300,10 @@ async def explain_fact(
 async def weak_facts(
     limit: Annotated[int, Field(ge=1, le=50)] = 20,
 ) -> list[dict]:
-    """List facts fading below confidence 0.3; offer re-confirmation."""
+    """Facts fading below effective confidence 0.3."""
     return await ctx.tools.weak_facts(limit=limit)
 
 
-# ------------------------------------------------------------ HTTP routes (http mode)
-@mcp.custom_route("/ingest", methods=["POST"])
-async def ingest(request: Request) -> JSONResponse:
-    data = await request.json()
-    message = data.get("message") or ""
-    session_id = data.get("session_id") or "default"
-    role = data.get("role", "user")
-    if not message:
-        return JSONResponse({"error": "message required"}, status_code=400)
-    if ctx and ctx.session_id and ctx.session_id != session_id:
-        old = ctx.session_id
-        asyncio.get_running_loop().create_task(ctx.consolidator.consolidate_session(old))
-    if ctx:
-        ctx.session_id = session_id
-        episode_id = await ctx.hot_path.record_message(session_id, message, role=role)
-        return JSONResponse({"episode_id": episode_id, "session_id": session_id})
-    return JSONResponse({"error": "server not initialized"}, status_code=500)
-
-
-@mcp.custom_route("/healthz", methods=["GET"])
-async def healthz(request: Request) -> JSONResponse:
-    return JSONResponse({"ok": ctx is not None})
-
-
-# ------------------------------------------------------------ entrypoint
 def main() -> None:
     settings.log_file.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -331,11 +312,8 @@ def main() -> None:
         handlers=[logging.StreamHandler(sys.stderr),
                   logging.FileHandler(settings.log_file)],
     )
-    logger.info("memory-mcp starting (transport=%s)", MCP_TRANSPORT)
-    if MCP_TRANSPORT == "http":
-        mcp.run(transport="http", host=settings.daemon_host, port=settings.daemon_port)
-    else:
-        mcp.run(transport="stdio")
+    logger.info("memory-mcp starting (stdio)")
+    mcp.run(transport="stdio")
 
 
 if __name__ == "__main__":

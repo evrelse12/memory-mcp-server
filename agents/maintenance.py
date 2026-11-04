@@ -1,6 +1,5 @@
 # agents/maintenance.py
-"""Nightly maintenance: consolidation, decay, enrichment, causal checks, housekeeping.
-Runs inside the single server process (APScheduler cron + catch-up on start)."""
+"""Nightly maintenance: consolidation, decay, enrichment, causal, housekeeping."""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +10,7 @@ import time
 from agents.llm_client import LLMError
 from config.settings import settings
 from core.storage import Storage
+from core.tasks import spawn
 from services.decay import DecayService
 from services.embedding import EmbeddingError, EmbeddingService
 from services.entity_index import EntityIndex
@@ -30,13 +30,11 @@ class MaintenanceService:
         self._ei = entity_index
         self._lock = asyncio.Lock()
 
-    # ------------------------------------------------------------ entry points
     async def run_if_overdue(self) -> None:
-        """Catch-up after downtime: no systemd timer needed."""
         last = await self._s.meta_get("last_maintenance_ts")
         now = int(time.time())
         if last is None or now - int(last) > OVERDUE_S:
-            asyncio.get_running_loop().create_task(self.run_nightly())
+            spawn(self.run_nightly(), name="catch-up-maintenance")
 
     async def run_nightly(self) -> dict:
         if self._lock.locked():
@@ -44,7 +42,7 @@ class MaintenanceService:
             return {}
         async with self._lock:
             now = int(time.time())
-            report: dict = {}
+            report = {}
             steps = (
                 ("consolidate", self._consolidate_pending),
                 ("decay", self._decay_step),
@@ -62,16 +60,18 @@ class MaintenanceService:
             logger.info("nightly maintenance report: %s", report)
             return report
 
-    # ------------------------------------------------------------ steps
     async def _consolidate_pending(self, now: int) -> dict:
+        """Only sessions with NEW episodes since last consolidation (no N writes)."""
         cutoff = now - settings.session_timeout_minutes * 60
-        read = self._s.db.get_read_connection()
-        async with read.execute("""
-                SELECT session_id FROM nodes
-                WHERE type='episodic' AND session_id IS NOT NULL
-                  AND valid_until IS NULL
-                GROUP BY session_id
-                HAVING MAX(event_time) < ?""", (cutoff,)) as cur:
+        sql = """
+            SELECT n.session_id FROM nodes n
+            LEFT JOIN sessions s ON s.session_id = n.session_id
+            WHERE n.type='episodic' AND n.session_id IS NOT NULL
+              AND n.valid_until IS NULL
+            GROUP BY n.session_id
+            HAVING MAX(n.event_time) < ?
+               AND MAX(n.event_time) > COALESCE(s.consolidated_at, 0)"""
+        async with self._s.db.get_read_connection().execute(sql, (cutoff,)) as cur:
             sids = [r["session_id"] for r in await cur.fetchall()]
         consolidated = 0
         for sid in sids:
@@ -79,7 +79,6 @@ class MaintenanceService:
             eps = [n for n in await self._s.fetch_nodes_by_session(sid, since)
                    if n["type"] == "episodic"]
             if not eps:
-                await self._s.mark_session_consolidated(sid, now)
                 continue
             if await self._c.consolidate_session(sid, episodes=eps):
                 consolidated += 1
@@ -89,8 +88,7 @@ class MaintenanceService:
         return await self._decay.run_night_job(now)
 
     async def _enrich_entities(self, now: int) -> dict:
-        read = self._s.db.get_read_connection()
-        async with read.execute("""
+        async with self._s.db.get_read_connection().execute("""
                 SELECT * FROM entities WHERE mention_count >= 3
                 ORDER BY mention_count DESC LIMIT 20""") as cur:
             rows = await cur.fetchall()
@@ -99,7 +97,7 @@ class MaintenanceService:
             attrs = json.loads(e["attributes"] or "{}")
             summary_at = attrs.get("summary_mentions", 0)
             if e["summary"] and e["mention_count"] < 2 * max(summary_at, 1):
-                continue                                   # refresh when mentions double
+                continue
             nodes = await self._s.fetch_nodes_for_entity(e["id"])
             if not nodes:
                 continue
@@ -126,16 +124,23 @@ class MaintenanceService:
         return {"updated": updated}
 
     async def _causal_step(self, now: int) -> dict:
-        read = self._s.db.get_read_connection()
-        async with read.execute("""
-                SELECT e.source_id AS new_id, e.target_id AS old_id FROM edges e
-                WHERE e.relation_type='temporal' AND e.valid_until IS NULL
-                  AND NOT EXISTS (SELECT 1 FROM causal_checked c
-                                  WHERE c.cause_id=e.target_id AND c.effect_id=e.source_id)
-                  AND NOT EXISTS (SELECT 1 FROM causal_checked c
-                                  WHERE c.cause_id=e.source_id AND c.effect_id=e.target_id)
-                ORDER BY e.valid_from DESC LIMIT ?""",
-                (settings.max_causal_pairs,)) as cur:
+        """Only user->user temporal pairs (skip question->assistant noise)."""
+        role_filter = ""
+        if settings.causal_user_only:
+            role_filter = ("AND json_extract(n1.metadata,'$.role')='user' "
+                           "AND json_extract(n2.metadata,'$.role')='user'")
+        sql = f"""
+            SELECT e.source_id AS new_id, e.target_id AS old_id FROM edges e
+            JOIN nodes n1 ON n1.id = e.source_id
+            JOIN nodes n2 ON n2.id = e.target_id
+            WHERE e.relation_type='temporal' AND e.valid_until IS NULL {role_filter}
+              AND NOT EXISTS (SELECT 1 FROM causal_checked c
+                              WHERE c.cause_id=e.target_id AND c.effect_id=e.source_id)
+              AND NOT EXISTS (SELECT 1 FROM causal_checked c
+                              WHERE c.cause_id=e.source_id AND c.effect_id=e.target_id)
+            ORDER BY e.valid_from DESC LIMIT ?"""
+        async with self._s.db.get_read_connection().execute(
+                sql, (settings.max_causal_pairs,)) as cur:
             pairs = [(r["new_id"], r["old_id"]) for r in await cur.fetchall()]
         checked = created = 0
         for new_id, old_id in pairs:
@@ -164,7 +169,7 @@ class MaintenanceService:
         return {"checked": checked, "created": created}
 
     async def _housekeep(self, now: int) -> dict:
-        purged = await self._decay.purge_expired(now)
+        """No purge here (decay night job owns it). Backfill + optimize only."""
         backfilled = 0
         ids = await self._s.nodes_without_vectors(100)
         if ids:
@@ -179,4 +184,4 @@ class MaintenanceService:
         await self._s.raw("INSERT INTO nodes_fts(nodes_fts) VALUES('optimize')")
         await self._s.raw("PRAGMA wal_checkpoint(TRUNCATE)")
         await self._s.raw("PRAGMA optimize")
-        return {"purged": purged, "backfilled": backfilled}
+        return {"backfilled": backfilled}

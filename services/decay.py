@@ -1,7 +1,9 @@
 # services/decay.py
-"""Ebbinghaus decay: effective confidence on the fly; night job only expires/purges.
+"""Ebbinghaus decay: effective confidence on the fly; night job expires/purges.
 
-effective(t) = confidence * exp(-decay_rate * age_days ** 0.8)
+effective = confidence * exp(-decay_rate * idle_days ** 0.8)
+Idle is measured from LAST ACCESS (falls back to created_at), so a recent
+lookup resets the forgetting curve, as the formula intends.
 """
 from __future__ import annotations
 
@@ -24,12 +26,11 @@ class DecayService:
 
     @staticmethod
     def effective_confidence(confidence: float, decay_rate: float,
-                              age_s: float) -> float:
-        days = max(0.0, age_s / DAY)
+                              idle_s: float) -> float:
+        days = max(0.0, idle_s / DAY)
         return confidence * math.exp(-decay_rate * (days ** settings.decay_exponent))
 
     async def expire_weak(self, now_ts: Optional[int] = None) -> int:
-        """Single UPDATE: effective confidence below threshold -> valid_until=now."""
         now = now_ts or int(time.time())
         thr = settings.decay_threshold
         if self._s.db.has_math_functions:
@@ -38,35 +39,36 @@ class DecayService:
                 WHERE type IN ('semantic','procedural','opinion')
                   AND valid_until IS NULL
                   AND confidence * EXP(-decay_rate *
-                      POWER((? - created_at) / ?, ?)) < ?""",
+                      POWER((? - COALESCE(last_accessed, created_at)) / ?, ?)) < ?""",
                 (now, now, DAY, settings.decay_exponent, thr)) or 0
         async with self._s.db.get_read_connection().execute("""
-                SELECT id, confidence, decay_rate, created_at FROM nodes
+                SELECT id, confidence, decay_rate, created_at, last_accessed
+                FROM nodes
                 WHERE type IN ('semantic','procedural','opinion')
                   AND valid_until IS NULL""") as cur:
             rows = await cur.fetchall()
         ids = [r["id"] for r in rows
-               if self.effective_confidence(r["confidence"], r["decay_rate"],
-                                            now - r["created_at"]) < thr]
+               if self.effective_confidence(
+                   r["confidence"], r["decay_rate"],
+                   now - (r["last_accessed"] or r["created_at"])) < thr]
         if not ids:
             return 0
         ph = ",".join("?" for _ in ids)
         return await self._s.execute(
             f"UPDATE nodes SET valid_until=? WHERE id IN ({ph})", (now, *ids)) or 0
 
-    async def purge_expired(self, now_ts: Optional[int] = None,
-                            retention_days: Optional[int] = None) -> int:
-        """Physical delete of long-expired rows; triggers clean FTS/vec/cascades."""
+    async def purge_expired(self, now_ts: Optional[int] = None) -> int:
+        """Physical delete only after a retention grace period (audit trail)."""
         now = now_ts or int(time.time())
-        ret = settings.episode_retention_days if retention_days is None else retention_days
+        cutoff = now - int(settings.soft_delete_retention_days * DAY)
         n1 = await self._s.execute(
             "DELETE FROM nodes WHERE valid_until IS NOT NULL AND valid_until < ?",
-            (now,)) or 0
+            (cutoff,)) or 0
         n2 = 0
-        if ret and ret > 0:
+        if settings.episode_retention_days > 0:
             n2 = await self._s.execute(
                 "DELETE FROM nodes WHERE type='episodic' AND event_time < ?",
-                (now - int(ret * DAY),)) or 0
+                (now - int(settings.episode_retention_days * DAY),)) or 0
         return n1 + n2
 
     async def run_night_job(self, now_ts: Optional[int] = None) -> dict:

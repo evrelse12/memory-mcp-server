@@ -161,7 +161,7 @@ class Storage:
         if since_ts is not None:
             sql += " AND event_time >= ?"
             params.append(since_ts)
-        sql += " ORDER BY event_time, rid"
+        sql += " ORDER BY event_time, rowid"
         async with self._read.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
@@ -181,25 +181,17 @@ class Storage:
         return await self._q.execute(
             f"UPDATE nodes SET {', '.join(sets)} WHERE id=?", tuple(params), wait=wait)
 
-    async def access_nodes(self, node_ids: Sequence[str], *,
-                           wait: bool = True) -> Optional[int]:
-        """Single UPDATE with ln() bonus; Python fallback without math functions."""
-        ids = list(node_ids)
+    async def access_nodes(self, ids, now=None):
+        """Reinforce ONLY the top-3 ranked hits, not the whole result page."""
+        ids = list(ids)[:3]
         if not ids:
             return 0
-        now = _now()
-        if self._db.has_math_functions:
-            return await self._q.execute(f"""
-                UPDATE nodes SET access_count = access_count + 1, last_accessed = ?,
-                  confidence = MIN(1.0, confidence * (1 + LN(access_count + 2) / 10))
-                WHERE id IN ({_ph(ids)})""", (now, *ids), wait=wait)
-        rows = await self.fetch_nodes(ids)
-        stmts = [(
-            "UPDATE nodes SET access_count=?, last_accessed=?, confidence=? WHERE id=?",
-            (r["access_count"] + 1, now,
-             min(1.0, r["confidence"] * (1 + math.log(r["access_count"] + 2) / 10)),
-             r["id"])) for r in rows]
-        return await self._q.transaction(stmts, wait=wait)
+        now = now or _now()
+        ph = ",".join("?" for _ in ids)
+        return await self._q.execute(
+            f"UPDATE nodes SET last_accessed=?, access_count=access_count+1, "
+            f"confidence=MIN(1.0, confidence * (1 + LN(access_count + 2) / 10)) "
+            f"WHERE id IN ({ph}) AND valid_until IS NULL", (now, *ids), wait=True)
 
     async def soft_delete_nodes(self, ids: Sequence[str], *,
                                 wait: bool = True) -> Optional[int]:
@@ -226,7 +218,7 @@ class Storage:
     async def nodes_without_vectors(self, limit: int = 200) -> list[str]:
         async with self._read.execute(
                 "SELECT id FROM nodes WHERE needs_embedding=1 "
-                "ORDER BY rid LIMIT ?", (limit,)) as cur:
+                "ORDER BY rowid LIMIT ?", (limit,)) as cur:
             rows = await cur.fetchall()
         return [r["id"] for r in rows]
 
@@ -263,34 +255,57 @@ class Storage:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------ entities
-    async def upsert_entity(self, data: dict, *, wait: bool = True) -> str:
-        """Deterministic id from name_norm; atomic mention_count bump."""
-        now = _now()
-        norm = data["name_norm"]
-        row = {
-            "id": data.get("id") or ("e_" + uuid.uuid5(uuid.NAMESPACE_URL, norm).hex[:16]),
-            "name_norm": norm,
-            "canonical_name": data.get("canonical_name") or norm,
-            "type": data["type"],
-            "aliases": json.dumps(data.get("aliases") or [], ensure_ascii=False),
-            "summary": data.get("summary"),
-            "first_seen": data.get("first_seen", now),
-            "last_updated": now,
-            "mention_count": 1,
-            "attributes": json.dumps(data.get("attributes") or {}, ensure_ascii=False),
-        }
-        cols, ph = ", ".join(ENTITY_COLS), _ph(ENTITY_COLS)
-        await self._q.execute(f"""
-            INSERT INTO entities ({cols}) VALUES ({ph})
+    async def upsert_entity(self, *, name_norm: str, canonical: str,
+                            etype: str = "concept", summary=None,
+                            wait: bool = True) -> str:
+        """Never clobber aliases/attributes/canonical; upgrade concept->specific."""
+        sql = """
+            INSERT INTO entities(id, name_norm, canonical_name, type, aliases,
+                                 summary, first_seen, last_updated,
+                                 mention_count, attributes)
+            VALUES (?,?,?,?,'[]',?, ?,?,1,'{}')
             ON CONFLICT(name_norm) DO UPDATE SET
-              mention_count  = mention_count + 1,
-              last_updated   = excluded.last_updated,
-              canonical_name = COALESCE(excluded.canonical_name, entities.canonical_name),
-              summary        = COALESCE(excluded.summary, entities.summary),
-              aliases        = excluded.aliases,
-              attributes     = excluded.attributes""",
-            tuple(row[c] for c in ENTITY_COLS), wait=wait)
+                mention_count = mention_count + 1,
+                last_updated  = excluded.last_updated,
+                type = CASE WHEN entities.type='concept'
+                            THEN excluded.type ELSE entities.type END,
+                summary = COALESCE(excluded.summary, entities.summary)"""
+        now = _now()
+        await self._q.execute(sql, (uuid.uuid4().hex, name_norm, canonical,
+                                    etype, summary, now, now), wait=wait)
+        async with self._db.get_read_connection().execute(
+                "SELECT id FROM entities WHERE name_norm=?", (name_norm,)) as cur:
+            row = await cur.fetchone()
         return row["id"]
+
+    async def merge_alias(self, entity_id: str, alias: str,
+                          wait: bool = True) -> None:
+        """Read-merge-write aliases in Python; never overwrite the list."""
+        async with self._db.get_read_connection().execute(
+                "SELECT aliases, canonical_name FROM entities WHERE id=?",
+                (entity_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return
+        aliases = json.loads(row["aliases"] or "[]")
+        if alias == row["canonical_name"] or alias in aliases:
+            return
+        aliases.append(alias)
+        await self._q.execute("UPDATE entities SET aliases=? WHERE id=?",
+                              (json.dumps(aliases, ensure_ascii=False), entity_id),
+                              wait=wait)
+
+    def link_entities_stmts(self, node_id: str, entity_ids) -> list[tuple[str, tuple]]:
+        return [("INSERT OR IGNORE INTO node_entities(node_id, entity_id) "
+                 "VALUES (?,?)", (node_id, eid)) for eid in entity_ids]
+
+    async def last_episode_id(self, session_id: str):
+        async with self._db.get_read_connection().execute(
+                "SELECT id FROM nodes WHERE type='episodic' AND session_id=? "
+                "ORDER BY event_time DESC, rowid DESC LIMIT 1",
+                (session_id,)) as cur:
+            row = await cur.fetchone()
+        return row["id"] if row else None
 
     async def link_node_entity(self, node_id: str, entity_id: str, *,
                                wait: bool = True) -> Optional[int]:
@@ -364,7 +379,7 @@ class Storage:
         if time_to is not None:
             sql += " AND n.event_time <= ?"
             params.append(time_to)
-        sql += " ORDER BY n.event_time DESC, n.rid DESC LIMIT ?"
+        sql += " ORDER BY n.event_time DESC, n.rowid DESC LIMIT ?"
         params.append(limit)
         async with self._read.execute(sql, params) as cur:
             rows = await cur.fetchall()
@@ -398,32 +413,26 @@ class Storage:
         await self._q.transaction(stmts, wait=wait)
         return nid
 
-    async def supersede_fact(self, old_id: str, *, content: str,
-                             confidence: float = 0.9,
-                             embedding: Optional[Sequence[float]] = None,
-                             source_episode_ids: Sequence[str] = (),
-                             wait: bool = True) -> str:
-        """New node + copied entity links + supersedes edge + old invalidated."""
-        old = await self.get_node(old_id)
-        if old is None:
-            raise KeyError(f"node not found: {old_id}")
+    async def supersede_fact(self, old_id, *, content, confidence=0.9,
+                             embedding=None, source_episode_ids=(),
+                             entity_ids=(), wait: bool = True) -> str:
         now = _now()
         stmt, nid = self.node_stmt({
-            "type": old["type"], "content": content, "confidence": confidence,
-            "session_id": old["session_id"], "event_time": now,
-            "needs_embedding": embedding is None,
+            "type": "semantic", "content": content, "confidence": confidence,
+            "event_time": now, "needs_embedding": embedding is None,
         })
-        stmts = [stmt]
+        stmts = [
+            ("UPDATE nodes SET valid_until=? WHERE id=? AND valid_until IS NULL",
+             (now, old_id)),
+            stmt,
+            self.edge_stmt(nid, old_id, "supersedes", predicate="replaces"),
+        ]
+        stmts += self.link_entities_stmts(nid, entity_ids)   # entities on NEW node
+        for ep in source_episode_ids:
+            stmts.append(self.edge_stmt(nid, ep, "derived_from", predicate="from"))
         if embedding is not None:
             stmts.append(self._vec_stmt(nid, embedding))
-        stmts.append(("INSERT INTO node_entities(node_id, entity_id) "
-                      "SELECT ?, entity_id FROM node_entities WHERE node_id=?",
-                      (nid, old_id)))
-        stmts.append(self.edge_stmt(nid, old_id, "supersedes", confidence=0.95))
-        stmts.append(("UPDATE nodes SET valid_until=?, confidence=0.3 WHERE id=?",
-                      (now, old_id)))
-        stmts += [self.edge_stmt(nid, ep, "derived_from", confidence=confidence)
-                  for ep in source_episode_ids]
+            stmts.append(("UPDATE nodes SET needs_embedding=0 WHERE id=?", (nid,)))
         await self._q.transaction(stmts, wait=wait)
         return nid
 
@@ -471,3 +480,125 @@ class Storage:
             "INSERT INTO meta(key, value) VALUES (?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value), wait=wait)
+
+    # ------------------------------------------------------------ add methods
+    async def fetch_entities_for_node(self, node_id: str) -> list[dict]:
+        """Single-node variant of get_entities_for_nodes."""
+        result = await self.get_entities_for_nodes([node_id])
+        return result.get(node_id, [])
+
+    async def fetch_timeline(self, *, entity_id: Optional[str] = None,
+                             time_from: Optional[int] = None,
+                             time_to: Optional[int] = None,
+                             limit: int = 20) -> list[dict]:
+        """Alias for fetch_episodes with chronological order (ASC)."""
+        sql = "SELECT n.* FROM nodes n WHERE n.type='episodic' AND n.valid_until IS NULL"
+        params: list[Any] = []
+        if entity_id:
+            sql += (" AND EXISTS(SELECT 1 FROM node_entities ne "
+                    "WHERE ne.node_id=n.id AND ne.entity_id=?)")
+            params.append(entity_id)
+        if time_from is not None:
+            sql += " AND n.event_time >= ?"
+            params.append(time_from)
+        if time_to is not None:
+            sql += " AND n.event_time <= ?"
+            params.append(time_to)
+        sql += " ORDER BY n.event_time ASC, n.rowid ASC LIMIT ?"  # ← ASC вместо DESC
+        params.append(limit)
+        async with self._read.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def stats(self) -> dict:
+        """Graph metrics: node/edge/entity counts, DB size."""
+        async with self._read.execute("""
+                SELECT type, COUNT(*) as cnt FROM nodes
+                WHERE valid_until IS NULL GROUP BY type""") as cur:
+            nodes_rows = await cur.fetchall()
+        nodes_by_type = {r["type"]: r["cnt"] for r in nodes_rows}
+
+        async with self._read.execute("""
+                SELECT relation_type, COUNT(*) as cnt FROM edges
+                WHERE valid_until IS NULL GROUP BY relation_type""") as cur:
+            edges_rows = await cur.fetchall()
+        edges_by_type = {r["relation_type"]: r["cnt"] for r in edges_rows}
+
+        async with self._read.execute("""
+                SELECT type, COUNT(*) as cnt FROM entities
+                GROUP BY type""") as cur:
+            ents_rows = await cur.fetchall()
+        entities_by_type = {r["type"]: r["cnt"] for r in ents_rows}
+
+        async with self._read.execute("""
+                SELECT COUNT(*) FROM nodes n
+                WHERE n.valid_until IS NULL AND n.type != 'episodic'
+                  AND NOT EXISTS (SELECT 1 FROM edges e
+                                  WHERE e.source_id=n.id OR e.target_id=n.id)
+                  AND NOT EXISTS (SELECT 1 FROM node_entities ne WHERE ne.node_id=n.id)
+            """) as cur:
+            orphans_row = await cur.fetchone()
+        orphans = orphans_row[0] if orphans_row else 0
+
+        async with self._read.execute("""
+                SELECT COUNT(*) FROM nodes WHERE needs_embedding=1
+                  AND valid_until IS NULL""") as cur:
+            vec_row = await cur.fetchone()
+        vec_available = vec_row[0] if vec_row else 0
+
+        db_size_mb = 0.0
+        if self._db.db_path.exists():
+            db_size_mb = round(self._db.db_path.stat().st_size / (1024 * 1024), 2)
+
+        return {
+            "nodes_by_type": nodes_by_type,
+            "edges_by_type": edges_by_type,
+            "entities_by_type": entities_by_type,
+            "orphans": orphans,
+            "vec_available": vec_available,
+            "db_size_mb": db_size_mb,
+        }
+
+    async def provenance(self, node_id: str) -> tuple[list[dict], list[dict], list[dict]]:
+        """Source episodes, supersedes chain, linked entities."""
+        # Soures (derived_from edges)
+        async with self._read.execute("""
+                SELECT n.* FROM nodes n
+                JOIN edges e ON e.target_id=n.id
+                WHERE e.source_id=? AND e.relation_type='derived_from'
+                  AND n.type='episodic'
+                ORDER BY n.event_time""", (node_id,)) as cur:
+            sources = [dict(r) for r in await cur.fetchall()]
+
+        # Supersedes chain (walk backwards)
+        superseded = []
+        current = node_id
+        visited = set()
+        while current and current not in visited:
+            visited.add(current)
+            async with self._read.execute("""
+                    SELECT target_id FROM edges
+                    WHERE source_id=? AND relation_type='supersedes'
+                    LIMIT 1""", (current,)) as cur:
+                row = await cur.fetchone()
+            if row:
+                old_id = row["target_id"]
+                old_node = await self.get_node(old_id, include_deleted=True)
+                if old_node:
+                    superseded.append(old_node)
+                current = old_id
+            else:
+                break
+
+        # Entities
+        entities = await self.fetch_entities_for_node(node_id)
+        return sources, superseded, entities
+
+    async def insert_entity_embedding(self, entity_id: str, emb: Sequence[float], *,
+                                      wait: bool = True) -> Optional[int]:
+        """Store embedding vector for entity."""
+        import sqlite_vec
+        vec_data = sqlite_vec.serialize_float32([float(x) for x in emb])
+        return await self._q.execute(
+            "INSERT OR REPLACE INTO vec_entities(entity_id, embedding) VALUES (?,?)",
+            (entity_id, vec_data), wait=wait)
