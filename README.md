@@ -232,13 +232,6 @@ In `~/.config/llama-server/mcp_config.json`:
 Maintenance runs inside the same process (APScheduler cron + catch-up on start).
 No systemd unit, crontab or HTTP daemon is required.
 
-## Migration from v1
-
-    python scripts/migrate_v1_to_v2.py /path/to/old/memory.db
-
-The script backs up the old file and migrates data into the new schema, then
-sets `PRAGMA user_version = 2`.
-
 ## Tests
 
     pytest -q

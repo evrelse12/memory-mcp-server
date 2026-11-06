@@ -239,13 +239,6 @@ RRF: `score(n) = Σ_c weight_c / (rrf_k + rank_c(n) + 1)`. Финальная о
 Обслуживание работает внутри того же процесса (cron APScheduler + догон при
 старте). Не нужны ни systemd-юнит, ни crontab, ни HTTP-демон.
 
-## Миграция с v1
-
-    python scripts/migrate_v1_to_v2.py /path/to/old/memory.db
-
-Скрипт делает бэкап старого файла и мигрирует данные в новую схему, затем
-ставит `PRAGMA user_version = 2`.
-
 ## Тесты
 
     pytest -q
