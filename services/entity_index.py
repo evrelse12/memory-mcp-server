@@ -6,7 +6,6 @@ import json
 import logging
 import re
 import unicodedata
-from typing import Optional
 
 from core.storage import Storage
 from services.embedding import EmbeddingService
@@ -60,7 +59,7 @@ class EntityIndex:
                     hits.append(canon)
         return hits
 
-    def resolve(self, name: str) -> Optional[str]:
+    def resolve(self, name: str) -> str | None:
         entry = self._by_norm.get(normalize_name(name))
         return entry[0] if entry else None
 

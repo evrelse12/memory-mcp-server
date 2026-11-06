@@ -47,7 +47,6 @@ class MaintenanceService:
                 ("consolidate", self._consolidate_pending),
                 ("decay", self._decay_step),
                 ("enrich", self._enrich_entities),
-                ("causal", self._causal_step),
                 ("housekeep", self._housekeep),
             )
             for name, step in steps:
@@ -123,51 +122,6 @@ class MaintenanceService:
             updated += 1
         return {"updated": updated}
 
-    async def _causal_step(self, now: int) -> dict:
-        """Only user->user temporal pairs (skip question->assistant noise)."""
-        role_filter = ""
-        if settings.causal_user_only:
-            role_filter = ("AND json_extract(n1.metadata,'$.role')='user' "
-                           "AND json_extract(n2.metadata,'$.role')='user'")
-        sql = f"""
-            SELECT e.source_id AS new_id, e.target_id AS old_id FROM edges e
-            JOIN nodes n1 ON n1.id = e.source_id
-            JOIN nodes n2 ON n2.id = e.target_id
-            WHERE e.relation_type='temporal' AND e.valid_until IS NULL {role_filter}
-              AND NOT EXISTS (SELECT 1 FROM causal_checked c
-                              WHERE c.cause_id=e.target_id AND c.effect_id=e.source_id)
-              AND NOT EXISTS (SELECT 1 FROM causal_checked c
-                              WHERE c.cause_id=e.source_id AND c.effect_id=e.target_id)
-            ORDER BY e.valid_from DESC LIMIT ?"""
-        async with self._s.db.get_read_connection().execute(
-                sql, (settings.max_causal_pairs,)) as cur:
-            pairs = [(r["new_id"], r["old_id"]) for r in await cur.fetchall()]
-        checked = created = 0
-        for new_id, old_id in pairs:
-            nodes = await self._s.fetch_nodes([new_id, old_id])
-            if len(nodes) < 2:
-                await self._s.mark_causal_checked(old_id, new_id, now)
-                continue
-            by_id = {n["id"]: n for n in nodes}
-            prompt = ("Does event 1 CAUSE event 2? Answer yes or no.\n"
-                      f"Event 1: {by_id[old_id]['content']}\n"
-                      f"Event 2: {by_id[new_id]['content']}")
-            try:
-                answer = (await self._c.llm.chat(
-                    [{"role": "user", "content": prompt}],
-                    max_tokens=4, temperature=0.0)).strip().casefold()
-            except LLMError:
-                continue
-            await self._s.mark_causal_checked(old_id, new_id, now)
-            checked += 1
-            if answer.startswith("yes"):
-                await self._s.insert_edge({
-                    "source_id": old_id, "target_id": new_id,
-                    "relation_type": "causal", "predicate": "caused",
-                    "confidence": settings.causal_confidence})
-                created += 1
-        return {"checked": checked, "created": created}
-
     async def _housekeep(self, now: int) -> dict:
         """No purge here (decay night job owns it). Backfill + optimize only."""
         backfilled = 0
@@ -176,7 +130,7 @@ class MaintenanceService:
             nodes = await self._s.fetch_nodes(ids)
             try:
                 embs = await self._emb.embed_documents([n["content"] for n in nodes])
-                for n, emb in zip(nodes, embs):
+                for n, emb in zip(nodes, embs, strict=False):
                     await self._s.insert_embedding_and_clear_flag(n["id"], emb)
                     backfilled += 1
             except EmbeddingError:

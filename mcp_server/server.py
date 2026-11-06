@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Literal
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastmcp import FastMCP
@@ -29,7 +30,7 @@ from services.embedding import EmbeddingService
 from services.entity_index import EntityIndex
 from services.hot_path import HotPath
 from services.search import SearchService
-from tools.memory_tools import MemoryTools, MemoryToolError
+from tools.memory_tools import MemoryToolError, MemoryTools
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +56,11 @@ class AppContext:
     consolidator: Consolidator
     maintenance: MaintenanceService
     tools: MemoryTools
-    scheduler: Optional[AsyncIOScheduler]
-    session_id: Optional[str] = None
+    scheduler: AsyncIOScheduler | None
+    session_id: str | None = None
 
 
-ctx: Optional[AppContext] = None
+ctx: AppContext | None = None
 
 
 async def build_context() -> AppContext:
@@ -77,7 +78,7 @@ async def build_context() -> AppContext:
     hot_path = HotPath(storage, embedding, entity_index)
     search = SearchService(storage, embedding, entity_index)
     decay = DecayService(storage)
-    consolidator = Consolidator(storage, embedding, entity_index)
+    consolidator = Consolidator(storage, search, embedding, entity_index)
     maintenance = MaintenanceService(storage, consolidator, decay, embedding,
                                      entity_index)
     tools = MemoryTools(storage, search, embedding, entity_index, decay)
@@ -95,36 +96,30 @@ async def build_context() -> AppContext:
     await maintenance.run_if_overdue()   # spawns catch-up task via registry
     return app
 
-async def teardown(app: Optional[AppContext]) -> None:
-    """Stop all background tasks and close resources with per-step timeouts."""
+async def teardown(app: AppContext | None) -> None:
     if app is None:
         return
-    
-    # 1. Stop scheduler (no wait)
+    # 1. Stop scheduler first (no wait)
     if app.scheduler:
         try:
             app.scheduler.shutdown(wait=False)
         except Exception:
             pass
-    
-    # 2. Drain background tasks (catch-up maintenance, embeddings)
+    # 2. Drain background tasks
     try:
         await asyncio.wait_for(drain_tasks(timeout=3), timeout=5)
     except (asyncio.TimeoutError, Exception):
         pass
-    
-    # 3. Stop WriteQueue (flush pending ops)
-    try:
-        await asyncio.wait_for(app.queue.stop(timeout=3), timeout=5)
-    except (asyncio.TimeoutError, Exception):
-        pass
-    
-    # 4. Optimize DB
+    # 3. PRAGMA optimize BEFORE stopping the queue (it needs a live connection)
     try:
         await asyncio.wait_for(app.storage.raw("PRAGMA optimize"), timeout=2)
     except (asyncio.TimeoutError, Exception):
         pass
-    
+    # 4. Flush WriteQueue
+    try:
+        await asyncio.wait_for(app.queue.stop(timeout=3), timeout=5)
+    except (asyncio.TimeoutError, Exception):
+        pass
     # 5. Close services
     for svc in (app.embedding, app.consolidator, app.db):
         try:
@@ -133,9 +128,15 @@ async def teardown(app: Optional[AppContext]) -> None:
             pass
 
 
+# Single-flight protection for concurrent signals
+_SHUTTING_DOWN = False
+
+
 async def _graceful_shutdown(sig: int) -> None:
-    """Drain the queue and run teardown (no loop.stop — breaks pytest)."""
-    global ctx
+    global ctx, _SHUTTING_DOWN
+    if _SHUTTING_DOWN:
+        return
+    _SHUTTING_DOWN = True
     logger.warning("signal %s: shutting down gracefully", sig)
     if ctx:
         try:
@@ -143,6 +144,14 @@ async def _graceful_shutdown(sig: int) -> None:
         except Exception:
             logger.exception("teardown failed")
         ctx = None
+    # Restore default handler and re-raise the signal so the process
+    # exits with the correct status and the parent sees it.
+    loop = asyncio.get_running_loop()
+    try:
+        loop.remove_signal_handler(sig)
+    except (NotImplementedError, RuntimeError):
+        pass
+    os.kill(os.getpid(), sig)
 
 @asynccontextmanager
 async def lifespan(server):
@@ -196,13 +205,12 @@ async def record_message(
 async def search_memory(
     query: Annotated[str, Field(description="Question or keywords, RU or EN")],
     node_types: Annotated[
-        Optional[list[Literal["episodic", "semantic", "procedural", "opinion"]]],
+        list[Literal["episodic", "semantic", "procedural", "opinion"]] | None,
         Field(description="Filter node types; omit for facts only")] = None,
     limit: Annotated[int, Field(ge=1, le=50)] = 10,
 ) -> list[dict]:
     """Search long-term memory before answering about user, people, projects, past."""
     return await ctx.tools.search_memory(query, node_types=node_types, limit=limit)
-
 
 @mcp.tool()
 @tool_errors
@@ -211,16 +219,17 @@ async def remember_fact(
         description="Self-contained sentence, explicit names, no pronouns")],
     node_type: Literal["semantic", "procedural", "opinion"] = "semantic",
     confidence: Annotated[float, Field(ge=0, le=1)] = 0.9,
-    entities: Annotated[Optional[list[str]],
+    entities: Annotated[list[str] | None,
         Field(description="Entity names; auto-extracted when omitted")] = None,
     pin: Annotated[bool, Field(description="Protect from forgetting")] = False,
+    force: Annotated[bool, Field(
+        description="Store even if a similar fact already exists")] = False,
 ) -> dict:
-    """Store a durable fact stated by the user (name, role, preference, project)."""
+    """Store a durable fact. May return duplicate/similar instead of creating."""
     ep = await ctx.storage.last_episode_id(ctx.session_id or "default")
     return await ctx.tools.remember_fact(
         content, node_type=node_type, confidence=confidence, entities=entities,
-        pin=pin, source_episode_ids=[ep] if ep else ())
-
+        pin=pin, force=force, source_episode_ids=[ep] if ep else ())
 
 @mcp.tool(annotations={"destructiveHint": True})
 @tool_errors
@@ -268,9 +277,9 @@ async def get_entity_info(
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def get_timeline(
-    entity_name: Annotated[Optional[str], Field(description="One entity")] = None,
-    time_from: Annotated[Optional[int], Field(description="Unix ts start")] = None,
-    time_to: Annotated[Optional[int], Field(description="Unix ts end")] = None,
+    entity_name: Annotated[str | None, Field(description="One entity")] = None,
+    time_from: Annotated[int | None, Field(description="Unix ts start")] = None,
+    time_to: Annotated[int | None, Field(description="Unix ts end")] = None,
     limit: Annotated[int, Field(ge=1, le=50)] = 20,
 ) -> list[dict]:
     """Chronological dialogue episodes."""

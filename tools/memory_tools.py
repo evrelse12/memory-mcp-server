@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
-from config.settings import settings
 from core.storage import Storage
 from services.decay import DecayService
 from services.embedding import EmbeddingError, EmbeddingService
@@ -36,30 +35,54 @@ class MemoryTools:
                             entity_ids=None, time_from=None, time_to=None,
                             limit: int = 10,
                             include_episodes: bool = False) -> list[dict]:
+        # entity_ids kept in signature for tool compatibility, but ignored
         return await self._search.search(
-            query, limit=limit, node_types=node_types, entity_ids=entity_ids,
+            query, limit=limit, node_types=node_types,
             time_from=time_from, time_to=time_to,
             include_episodes=include_episodes)
 
     async def remember_fact(self, content: str, *, node_type: str = "semantic",
                             confidence: float = 0.9,
-                            entities: Optional[Sequence[str]] = None,
+                            entities: Sequence[str] | None = None,
                             source_episode_ids: Sequence[str] = (),
-                            pin: bool = False) -> dict:
+                            pin: bool = False,
+                            force: bool = False) -> dict:
         if node_type not in FACT_TYPES:
             raise MemoryToolError(f"bad node_type: {node_type!r}")
         confidence = min(1.0, max(0.0, float(confidence)))
 
+        # Embed ONCE; reuse the vector for dedupe and for storage.
         emb = None
         try:
             emb = await self._emb.embed_document(content)
         except EmbeddingError as e:
             logger.warning("embedding unavailable, storing without vector: %s", e)
 
-        # auto-extraction is INTERNAL and always on; canonical names from the table
+        action, existing = await self._search.dedupe_candidate(content, emb=emb)
+
+        if action == "skip" and existing and not force:
+            # A repeated mention confirms the fact: reinforce it.
+            await self._s.access_nodes([existing["id"]])
+            pinned = False
+            if pin:
+                await self.confirm_fact(existing["id"])
+                pinned = True
+            return {"status": "duplicate",
+                    "existing_id": existing["id"],
+                    "existing_content": existing["content"],
+                    "pinned": pinned,
+                    "hint": "call correct_fact if the new text contradicts it"}
+
+        if action == "conflict" and existing and not force:
+            # Conflict band: let the model choose replace vs keep-both.
+            return {"status": "similar",
+                    "existing_id": existing["id"],
+                    "existing_content": existing["content"],
+                    "hint": "call correct_fact to replace it, or "
+                            "remember_fact(force=true) to keep both"}
+
         names = list(entities or []) or self._ei.find_in_text(content)
         eids = [await self._ei.ensure(n) for n in names]
-
         nid = await self._s.create_fact(
             content=content, node_type=node_type,
             confidence=1.0 if pin else confidence,
@@ -83,11 +106,11 @@ class MemoryTools:
         names = self._ei.find_in_text(new_content)
         eids = [await self._ei.ensure(n) for n in names]
         nid = await self._s.supersede_fact(
-            old_node_id, content=new_content, confidence=new_confidence,
-            embedding=emb, source_episode_ids=list(source_episode_ids),
-            entity_ids=eids)
+            old_node_id, node_type=old["type"], content=new_content,
+            confidence=new_confidence, embedding=emb,
+            source_episode_ids=list(source_episode_ids), entity_ids=eids)
         return {"status": "corrected", "old_node_id": old_node_id,
-                "new_node_id": nid}
+                "new_node_id": nid, "preserved_type": old["type"]}
 
     async def confirm_fact(self, node_id: str) -> dict:
         n = await self._s.execute(
@@ -120,7 +143,7 @@ class MemoryTools:
             {"id": n["id"], "content": n["content"], "type": n["type"]}
             for n in nodes[:20]]}
 
-    async def get_timeline(self, *, entity_name: Optional[str] = None,
+    async def get_timeline(self, *, entity_name: str | None = None,
                            time_from=None, time_to=None,
                            limit: int = 20) -> list[dict]:
         eid = self._ei.resolve(entity_name) if entity_name else None
@@ -129,7 +152,14 @@ class MemoryTools:
         return rows
 
     async def memory_stats(self) -> dict:
-        return await self._s.stats()
+        s = await self._s.stats()
+        # vec_available = is the embedding service answering RIGHT NOW?
+        try:
+            await self._emb.embed_query("ping")
+            vec_available = True
+        except Exception:
+            vec_available = False
+        return {**s, "vec_available": vec_available}
 
     async def explain_fact(self, node_id: str) -> dict:
         node = await self._s.get_node(node_id, include_deleted=True)

@@ -29,9 +29,8 @@ class HotPath:
 
     async def record_message(self, session_id: str, message: str, *,
                              role: str = "user") -> str:
-        text = message[: settings.max_episode_chars]   # enforce configured limit
+        text = message[: settings.max_episode_chars]
         async with self._lock(session_id):
-            prev = await self._s.last_episode_id(session_id)
             now = int(time.time())
             stmt, nid = self._s.node_stmt({
                 "type": "episodic", "content": text, "session_id": session_id,
@@ -39,9 +38,9 @@ class HotPath:
                 "needs_embedding": True, "metadata": {"role": role},
             })
             stmts = [stmt]
-            if prev:
-                stmts.append(self._s.edge_stmt(nid, prev, "temporal",
-                                               predicate="follows"))
+            # NOTE: temporal edges are no longer written. Nothing reads them
+            # (the causal step and the episode-graph walk were removed);
+            # ordering is recovered from (session_id, event_time, rid).
             for canon in self._ei.find_in_text(text):
                 eid = await self._ei.ensure(canon)
                 stmts += self._s.link_entities_stmts(nid, [eid])

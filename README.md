@@ -46,7 +46,7 @@ Edges are first-class typed rows (not just node pairs):
 
 | Type | Direction | Meaning |
 |------|-----------|---------|
-| `temporal` | episode → previous episode | "follows" in a dialogue |
+| `temporal` | (reserved) | the schema supports it, but nothing writes temporal edges now; ordering is recovered from `(session_id, event_time, rid)` |
 | `derived_from` | fact → episode | provenance of the fact |
 | `entity` | node → entity (via `node_entities`) | mentions |
 | `supersedes` | new fact → old fact | correction chain |
@@ -101,12 +101,11 @@ exponential term is 1 regardless of age.
 Every dialogue turn, the model (instructed by `SERVER_INSTRUCTIONS`) first calls
 `record_message` with the exact user text. `HotPath.record_message`:
 
-1. Grabs a per-session lock so two parallel messages can't fork the temporal chain.
+1. Grabs a per-session lock so two parallel messages can't fork the write chain.
 2. Truncates the text to `settings.max_episode_chars` (default 4000).
-3. Finds the previous episode in the session and links them with a `temporal` edge.
-4. Runs `EntityIndex.find_in_text` (bounded regex) to detect mentioned entities.
-5. Inserts the episode node, the temporal edge and the entity links in one transaction.
-6. Spawns a background task to embed the episode (best-effort; deferred on failure).
+3. Runs `EntityIndex.find_in_text` (bounded regex) to detect mentioned entities.
+4. Inserts the episode node and the entity links in one transaction.
+5. Spawns a background task to embed the episode (best-effort; deferred on failure).
 
 **Limitation**: this path only works if the model reliably calls
 `record_message` every turn and passes the exact text. Small models sometimes
@@ -186,7 +185,7 @@ not full rows — keeps the LLM context small.
 |------|---------|
 | `record_message` | Write the user's exact text as an episode. **First call every turn.** |
 | `search_memory` | Hybrid search over facts and episodes. |
-| `remember_fact` | Store a durable fact. Returns `duplicate` if a similar one exists. |
+| `remember_fact` | Store a durable fact. Returns `duplicate` (reinforced, optionally pinned) or `similar` (conflict band: use `correct_fact` or `force=true`). |
 | `correct_fact` | Replace an outdated fact (preserves the old node's type via `supersedes`). |
 | `confirm_fact` | Pin a fact permanently (`decay_rate=0`, `confidence=1`). |
 | `forget_fact` | Soft- or hard-delete a fact. |
@@ -214,7 +213,7 @@ maintenance runs from overlapping.
 ## Install
 
     python3 -m venv venv && source venv/bin/activate
-    pip install -r requirements.txt
+    pip install -e .[dev]
     cp .env.example .env   # adjust URLs and models
 
 ## Run (stdio, llama-server)

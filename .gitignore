@@ -1,32 +1,24 @@
-# Виртуальное окружение Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
 venv/
 .venv/
-
-# База данных (содержит личную память!)
-db/
-bd/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.env
+logs/*
+!logs/.gitkeep
+db/*
+!db/.gitkeep
 *.db
 *.db-wal
 *.db-shm
-
-# Конфигурации с секретными ключами
-.env
-.env.local
-
-# Логи
-logs/
-*.log
-
-# Кэш Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-
-# Системные файлы
-.DS_Store
+libsqlite_vec0.a
+intent_cache.json
 .idea/
 .vscode/
-
-# Доп файлы
-intent_cache.json
+.DS_Store

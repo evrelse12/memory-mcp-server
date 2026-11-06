@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 import aiosqlite
 
@@ -15,7 +14,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class WriteOp:
     stmts: list[tuple[str, tuple]]
-    future: Optional[asyncio.Future]
+    future: asyncio.Future | None
     many: bool = False
     raw: bool = False
 
@@ -26,7 +25,7 @@ class WriteQueue:
         self._conn = conn
         self._batch = batch
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         self._worker_task = asyncio.get_running_loop().create_task(self._worker())

@@ -25,18 +25,22 @@ class FakeLLM:
     async def close(self):
         pass
 
+async def _fake_call_batch(self, texts, *, prefix=""):
+    """Fake batch embedding: return deterministic vectors for all texts."""
+    return [[0.1] * 256 for _ in texts]
 
 async def _fake_call(self, text, *, prefix=""):
+    """Fake single embedding."""
     return [0.1] * 256
-
 
 @pytest.fixture
 def patched_services(monkeypatch):
     """Swap LLM client and embedding network calls for offline determinism."""
     import agents.consolidator as cons_mod
     monkeypatch.setattr(cons_mod, "LLMClient", lambda: FakeLLM())
+    # Patch BOTH the batch and single methods
+    monkeypatch.setattr(emb_mod.EmbeddingService, "_call_batch", _fake_call_batch)
     monkeypatch.setattr(emb_mod.EmbeddingService, "_call", _fake_call)
-
 
 @pytest.mark.asyncio
 async def test_consolidation_extracts_and_marks(fresh_db, patched_services):
@@ -100,3 +104,24 @@ async def test_purge_respects_retention(fresh_db):
         assert purged == 0
         node = await ctx.storage.get_node(r["node_id"], include_deleted=True)
         assert node is not None
+
+@pytest.mark.asyncio
+async def test_remember_duplicate_and_pin(fresh_db, patched_services):
+    """Same content twice -> duplicate; pin on a duplicate pins the original."""
+    async with server.lifespan(server.mcp):
+        ctx = server.ctx
+        r1 = await ctx.tools.remember_fact("The user works at Google")
+        assert r1["status"] == "created"
+        first_id = r1["node_id"]
+
+        r2 = await ctx.tools.remember_fact("The user works at Google")
+        assert r2["status"] == "duplicate"
+        assert r2["existing_id"] == first_id
+        assert r2["pinned"] is False
+
+        r3 = await ctx.tools.remember_fact("The user works at Google", pin=True)
+        assert r3["status"] == "duplicate"
+        assert r3["pinned"] is True
+        node = await ctx.storage.get_node(first_id)
+        assert node["decay_rate"] == 0.0
+        assert node["confidence"] == 1.0

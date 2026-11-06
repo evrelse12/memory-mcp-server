@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Optional
 
 from config.settings import settings
 from core.storage import Storage
@@ -30,7 +29,7 @@ class DecayService:
         days = max(0.0, idle_s / DAY)
         return confidence * math.exp(-decay_rate * (days ** settings.decay_exponent))
 
-    async def expire_weak(self, now_ts: Optional[int] = None) -> int:
+    async def expire_weak(self, now_ts: int | None = None) -> int:
         now = now_ts or int(time.time())
         thr = settings.decay_threshold
         if self._s.db.has_math_functions:
@@ -57,7 +56,7 @@ class DecayService:
         return await self._s.execute(
             f"UPDATE nodes SET valid_until=? WHERE id IN ({ph})", (now, *ids)) or 0
 
-    async def purge_expired(self, now_ts: Optional[int] = None) -> int:
+    async def purge_expired(self, now_ts: int | None = None) -> int:
         """Physical delete only after a retention grace period (audit trail)."""
         now = now_ts or int(time.time())
         cutoff = now - int(settings.soft_delete_retention_days * DAY)
@@ -71,7 +70,7 @@ class DecayService:
                 (now - int(settings.episode_retention_days * DAY),)) or 0
         return n1 + n2
 
-    async def run_night_job(self, now_ts: Optional[int] = None) -> dict:
+    async def run_night_job(self, now_ts: int | None = None) -> dict:
         now = now_ts or int(time.time())
         expired = await self.expire_weak(now)
         purged = await self.purge_expired(now)

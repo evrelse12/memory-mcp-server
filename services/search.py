@@ -1,18 +1,21 @@
 # services/search.py
 """Hybrid retrieval: FTS5 (OR) + sqlite-vec KNN + anchored graph + entities, RRF.
-Final ranking multiplies RRF score by effective confidence measured from the
-LAST ACCESS (falls back to created_at), so used facts stay on top."""
+
+Final ranking multiplies the RRF score by effective confidence measured from
+LAST ACCESS (falls back to created_at), so recently used facts stay on top.
+"""
 from __future__ import annotations
 
 import logging
 import re
 import time
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import sqlite_vec
 
 from config.settings import settings
 from core.storage import Storage
+from core.tasks import spawn
 from services.decay import DecayService
 from services.embedding import EmbeddingError, EmbeddingService
 from services.entity_index import EntityIndex
@@ -40,12 +43,11 @@ class SearchService:
         self._ei = entity_index
         self._decay = DecayService(storage)
 
-    # ---------------------------------------------------------- public
+    # ---------------------------------------------------------- public API
     async def search(self, query: str, *, limit: int = 10,
-                     node_types: Optional[Sequence[str]] = None,
-                     entity_ids: Optional[Sequence[str]] = None,
-                     time_from: Optional[int] = None,
-                     time_to: Optional[int] = None,
+                     node_types: Sequence[str] | None = None,
+                     time_from: int | None = None,
+                     time_to: int | None = None,
                      include_episodes: bool = False) -> list[dict]:
         limit = min(limit, settings.max_search_limit)
         now = int(time.time())
@@ -58,8 +60,12 @@ class SearchService:
 
         fused = self._rrf({"fts": fts, "vec": vec, "graph": graph,
                            "entity": entity}, limit)
-        rows = await self._s.fetch_nodes([i for i, _ in fused])
+        node_ids = [i for i, _ in fused]
+        rows = await self._s.fetch_nodes(node_ids)
         by_id = {r["id"]: r for r in rows}
+
+        # ONE batched call for entities of ALL result nodes (fixes N+1)
+        entities_map = await self._s.get_entities_for_nodes(node_ids)
 
         out = []
         for nid, score in fused:
@@ -69,7 +75,8 @@ class SearchService:
             idle = now - (r["last_accessed"] or r["created_at"])
             eff = self._decay.effective_confidence(
                 r["confidence"], r["decay_rate"], idle)
-            ents = await self._s.fetch_entities_for_node(nid)
+            # Only canonical names go to the LLM, not full entity rows
+            ents = [e["canonical_name"] for e in entities_map.get(nid, [])]
             out.append({
                 "id": r["id"], "type": r["type"], "content": r["content"],
                 "confidence": round(eff, 4), "event_time": r["event_time"],
@@ -77,22 +84,79 @@ class SearchService:
             })
         out.sort(key=lambda d: d["score"], reverse=True)
         out = out[:limit]
-        # reinforcement capped to top-3 inside storage.access_nodes
-        await self._s.access_nodes([d["id"] for d in out])
+
+        # Reinforcement is a WRITE: run it in the background so a failed or
+        # slow write (e.g. SQLite without LN()) can never kill the search.
+        spawn(self._safe_access([d["id"] for d in out]), name="access-nodes")
         return out
+
+    async def _safe_access(self, ids: Sequence[str]) -> None:
+        try:
+            await self._s.access_nodes(ids)
+        except Exception as e:
+            logger.debug("access_nodes failed (non-fatal): %s", e)
+
+    async def dedupe_candidate(self, content: str, *,
+                               emb: Sequence[float] | None = None,
+                               exclude_id: str | None = None,
+                               node_types: Sequence[str] = (
+                                   "semantic", "procedural", "opinion"),
+                               threshold: float | None = None
+                               ) -> tuple[str, dict | None]:
+        """Pure vector-similarity duplicate check (no LLM arbitration).
+
+        Returns ('skip' | 'conflict' | 'insert', existing_node_or_None).
+        Pass emb= when the caller already embedded the text to avoid a
+        second HTTP round-trip per fact.
+        """
+        thr = (threshold if threshold is not None
+               else settings.dedup_similarity_threshold)
+        if emb is None:
+            try:
+                emb = await self._emb.embed_document(content)
+            except EmbeddingError:
+                return "insert", None
+
+        where, params = self._filters(node_types, None, None, False)
+        if exclude_id:
+            where += " AND n.id != ?"
+            params.append(exclude_id)
+        sql = f"""
+            SELECT n.id, n.content, n.type, v.distance FROM (
+                SELECT node_id, distance FROM vec_nodes
+                WHERE embedding MATCH ? AND k = ?
+            ) v JOIN nodes n ON n.id = v.node_id
+            WHERE {where} ORDER BY v.distance LIMIT 1"""
+        async with self._s.db.get_read_connection().execute(
+                sql, (sqlite_vec.serialize_float32([float(x) for x in emb]),
+                      settings.knn_k, *params)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return "insert", None
+        # embeddings are L2-normalized, so cosine == 1 - d^2 / 2
+        sim = 1.0 - row["distance"] ** 2 / 2.0
+        info = {"id": row["id"], "content": row["content"], "type": row["type"]}
+        if sim >= thr:
+            return "skip", info
+        if sim >= settings.conflict_band_min:
+            return "conflict", info
+        return "insert", None
 
     # ---------------------------------------------------------- channels
     def _filters(self, node_types, time_from, time_to, include_episodes):
         clauses, params = [], []
         types = list(node_types) if node_types else (
-            ["semantic", "procedural", "opinion"] + (["episodic"] if include_episodes else []))
+            ["semantic", "procedural", "opinion"]
+            + (["episodic"] if include_episodes else []))
         clauses.append(f"type IN ({','.join('?' for _ in types)})")
         params += types
         clauses.append("valid_until IS NULL")
         if time_from:
-            clauses.append("event_time >= ?"); params.append(time_from)
+            clauses.append("event_time >= ?")
+            params.append(time_from)
         if time_to:
-            clauses.append("event_time <= ?"); params.append(time_to)
+            clauses.append("event_time <= ?")
+            params.append(time_to)
         return " AND ".join(clauses), params
 
     async def _fts(self, query, node_types, t_from, t_to, include_episodes):
@@ -100,6 +164,7 @@ class SearchService:
         if not fts_q:
             return []
         where, params = self._filters(node_types, t_from, t_to, include_episodes)
+        # rowid works with or without the explicit rid column
         sql = f"""
             SELECT n.id, bm25(nodes_fts) AS rank
             FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
@@ -125,7 +190,7 @@ class SearchService:
             WHERE {where} ORDER BY v.distance LIMIT 40"""
         async with self._s.db.get_read_connection().execute(
                 sql, (sqlite_vec.serialize_float32([float(x) for x in emb]),
-                      settings.rrf_k, *params)) as cur:
+                      settings.knn_k, *params)) as cur:
             rows = await cur.fetchall()
         return [(r["id"], 1.0 - r["distance"] ** 2 / 2.0) for r in rows]
 

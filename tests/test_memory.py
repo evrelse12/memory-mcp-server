@@ -70,3 +70,15 @@ def test_decay_uses_last_access():
     eff = DecayService.effective_confidence
     assert eff(0.9, 0.1, 70 * 86400) < 0.05
     assert eff(0.9, 0.1, 1 * 86400) > 0.5
+
+@pytest.mark.asyncio
+async def test_record_message_and_timeline_last_n(fresh_db):
+    """With limit=5 and 25 messages, get the LAST 5 in chronological order."""
+    async with server.lifespan(server.mcp):
+        for i in range(25):
+            await server.ctx.hot_path.record_message("s1", f"message #{i}")
+        async with Client(server.mcp) as c:
+            r = _data(await c.call_tool("get_timeline", {"limit": 5}))
+    contents = [x["content"] for x in r]
+    assert contents == ["message #20", "message #21", "message #22",
+                        "message #23", "message #24"]

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import platform
 from pathlib import Path
 
@@ -14,7 +13,7 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Database:
@@ -43,6 +42,7 @@ class Database:
         await self._guard_schema_version()
         await self._create_schema()
         await self._apply_pragmas()
+        await self._check_embedding_meta()   # AFTER _apply_pragmas, OUTSIDE it
         logger.info("Database initialized: %s (schema v%d)",
                     self.db_path, SCHEMA_VERSION)
 
@@ -79,9 +79,12 @@ class Database:
             existing = {r[0] for r in await cur.fetchall()}
 
         if "nodes" not in existing:
+            # rid is an explicit autoincrement PK; FTS5 rowid joins against it
+            # and VACUUM is guaranteed to preserve it because it is the PK.
             async with w.execute("""
                 CREATE TABLE nodes (
-                    id TEXT PRIMARY KEY,
+                    rid INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id TEXT NOT NULL UNIQUE,
                     type TEXT NOT NULL CHECK(type IN
                         ('episodic','semantic','procedural','opinion')),
                     content TEXT NOT NULL,
@@ -168,60 +171,71 @@ class Database:
             """):
                 pass
 
-        # FTS5 — virtual table, recreated if schema changes; stable rowid for joins
+        # FTS5 virtual table: rowid joins against nodes.rid
         async with w.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts
-            USING fts5(content, content='nodes', content_rowid='rowid',
+            USING fts5(content, content='nodes', content_rowid='rid',
                        tokenize='porter unicode61')
         """):
             pass
 
-        # Triggers to keep FTS5 in sync with nodes
         async with w.execute("""
             CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON nodes BEGIN
-                INSERT INTO nodes_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
+                INSERT INTO nodes_fts(rowid, content) VALUES (NEW.rid, NEW.content);
             END
         """):
             pass
         async with w.execute("""
             CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON nodes BEGIN
                 INSERT INTO nodes_fts(nodes_fts, rowid, content)
-                VALUES ('delete', OLD.rowid, OLD.content);
+                VALUES ('delete', OLD.rid, OLD.content);
             END
         """):
             pass
+        # Fire ONLY on content change — other UPDATEs must not churn FTS.
         async with w.execute("""
-            CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON nodes BEGIN
+            CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE OF content ON nodes BEGIN
                 INSERT INTO nodes_fts(nodes_fts, rowid, content)
-                VALUES ('delete', OLD.rowid, OLD.content);
-                INSERT INTO nodes_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
+                VALUES ('delete', OLD.rid, OLD.content);
+                INSERT INTO nodes_fts(rowid, content) VALUES (NEW.rid, NEW.content);
             END
         """):
             pass
 
-        # vec0 virtual table (does NOT support UPSERT — use INSERT OR REPLACE)
-        async with w.execute("""
+        # vec0 virtual tables; dimension comes from settings, not hardcoded
+        dim = settings.embedding_dim
+        async with w.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_nodes
-            USING vec0(node_id TEXT PRIMARY KEY, embedding float[256])
+            USING vec0(node_id TEXT PRIMARY KEY, embedding float[{dim}])
         """):
             pass
-
-        # vec0 virtual table for entities
-        async with w.execute("""
+        async with w.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_entities
-            USING vec0(entity_id TEXT PRIMARY KEY, embedding float[256])
+            USING vec0(entity_id TEXT PRIMARY KEY, embedding float[{dim}])
         """):
             pass
 
-        # Indexes (idempotent via IF NOT EXISTS)
+        # Indexes (idempotent)
         for idx in (
-            "CREATE INDEX IF NOT EXISTS idx_nodes_type_valid ON nodes(type, valid_until)",
-            "CREATE INDEX IF NOT EXISTS idx_nodes_session ON nodes(session_id, event_time)",
-            "CREATE INDEX IF NOT EXISTS idx_nodes_event_time ON nodes(event_time)",
-            "CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation_type, valid_until)",
-            "CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, valid_until)",
-            "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, valid_until)",
-            "CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)",
+            "CREATE INDEX IF NOT EXISTS idx_nodes_type_valid "
+            "ON nodes(type, valid_until)",
+            "CREATE INDEX IF NOT EXISTS idx_nodes_session "
+            "ON nodes(session_id, event_time)",
+            "CREATE INDEX IF NOT EXISTS idx_nodes_event_time "
+            "ON nodes(event_time)",
+            "CREATE INDEX IF NOT EXISTS idx_edges_relation "
+            "ON edges(relation_type, valid_until)",
+            "CREATE INDEX IF NOT EXISTS idx_edges_source "
+            "ON edges(source_id, valid_until)",
+            "CREATE INDEX IF NOT EXISTS idx_edges_target "
+            "ON edges(target_id, valid_until)",
+            "CREATE INDEX IF NOT EXISTS idx_entities_type "
+            "ON entities(type)",
+            "CREATE INDEX IF NOT EXISTS idx_node_entities_entity "
+            "ON node_entities(entity_id)",
+            # unique triple for ON CONFLICT DO NOTHING to actually dedupe edges
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_triple "
+            "ON edges(source_id, target_id, relation_type)",
         ):
             async with w.execute(idx):
                 pass
@@ -231,11 +245,7 @@ class Database:
 
     async def _apply_pragmas(self) -> None:
         w = self._write
-        # Check whether sqlite was built with math functions (needed for decay SQL)
-        async with w.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
-                "AND name='nodes'") as cur:
-            await cur.fetchone()
+        # Probe math functions (for decay SQL).
         try:
             async with w.execute("SELECT EXP(1.0) AS v") as cur:
                 await cur.fetchone()
@@ -251,8 +261,51 @@ class Database:
                   "PRAGMA busy_timeout=5000"):
             async with w.execute(p) as cur:
                 await cur.fetchone()
-
         logger.info("Pragmas applied (math_functions=%s)", self.has_math_functions)
+
+    async def _check_embedding_meta(self) -> None:
+        """Fail fast when embedding model or dim changed since DB creation."""
+        async with self._write.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='meta'") as cur:
+            if await cur.fetchone() is None:
+                return
+        async with self._write.execute(
+                "SELECT key, value FROM meta "
+                "WHERE key IN ('embedding_dim','embedding_model')") as cur:
+            stored = {r["key"]: r["value"] for r in await cur.fetchall()}
+
+        dim = stored.get("embedding_dim")
+        if dim is not None and int(dim) != settings.embedding_dim:
+            await self._close_both()
+            raise RuntimeError(
+                f"embedding_dim mismatch: DB has {dim}, config wants "
+                f"{settings.embedding_dim}. Set MEMORY_EMBEDDING_DIM={dim} "
+                f"or migrate.")
+        model = stored.get("embedding_model")
+        if model is not None and model != settings.embedding_model:
+            await self._close_both()
+            raise RuntimeError(
+                f"embedding_model mismatch: DB has {model!r}, config wants "
+                f"{settings.embedding_model!r}. Vectors are not comparable "
+                f"across models; migrate or set MEMORY_EMBEDDING_MODEL={model}.")
+
+        # isolation_level=None -> autocommit; no WriteQueue needed here
+        await self._write.execute(
+            "INSERT INTO meta(key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("embedding_dim", str(settings.embedding_dim)))
+        await self._write.execute(
+            "INSERT INTO meta(key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("embedding_model", settings.embedding_model))
+
+    async def _close_both(self) -> None:
+        for conn in (self._write, self._read):
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
     async def close(self) -> None:
         if self._write:

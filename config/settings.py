@@ -51,15 +51,12 @@ class Settings(BaseSettings):
     decay_exponent: float = Field(default=0.8, gt=0.0, le=1.0)
 
     rrf_k: int = Field(default=60, ge=1)
+    knn_k: int = Field(default=20, ge=1, le=200)
     rrf_weight_fts: float = Field(default=1.0, ge=0.0)
     rrf_weight_vec: float = Field(default=1.0, ge=0.0)
     rrf_weight_graph: float = Field(default=1.0, ge=0.0)
     max_search_limit: int = Field(default=50, ge=1, le=200)
     dedup_similarity_threshold: float = Field(default=0.92, gt=0.0, lt=1.0)
-
-    causal_user_only: bool = True
-    causal_confidence: float = Field(default=0.7, ge=0.0, le=1.0)
-    max_causal_pairs: int = Field(default=10, ge=1, le=200)
 
     log_level: str = "INFO"
 

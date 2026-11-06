@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
-import sqlite_vec
-
-from agents.llm_client import LLMClient, LLMError
+from agents.llm_client import LLMClient
 from config.settings import settings
 from core.storage import Storage
 from services.embedding import EmbeddingError, EmbeddingService
 from services.entity_index import EntityIndex
+from services.search import SearchService
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +36,11 @@ Are A and B about the same topic? Answer exactly one word: same | contradicts | 
 
 
 class Consolidator:
-    def __init__(self, storage: Storage, embedding: EmbeddingService,
-                 entity_index: EntityIndex, llm: Optional[LLMClient] = None):
+    def __init__(self, storage: Storage, search: SearchService,
+                 embedding: EmbeddingService, entity_index: EntityIndex,
+                 llm: LLMClient | None = None):
         self._s = storage
+        self._search = search
         self._emb = embedding
         self._ei = entity_index
         self.llm = llm or LLMClient()
@@ -49,7 +49,7 @@ class Consolidator:
         await self.llm.close()
 
     async def consolidate_session(self, session_id: str,
-                                  episodes: Optional[list[dict]] = None) -> bool:
+                                  episodes: list[dict] | None = None) -> bool:
         if episodes is None:
             since = await self._s.session_consolidated_at(session_id)
             episodes = [n for n in await self._s.fetch_nodes_by_session(session_id, since)
@@ -118,44 +118,13 @@ class Consolidator:
                         "sources": sources, "entities": ents})
         return out
 
-    async def _dedupe(self, emb, content):
-        sql = """
-            SELECT n.id, n.content, v.distance FROM (
-                SELECT node_id, distance FROM vec_nodes
-                WHERE embedding MATCH ? AND k = 5
-            ) v JOIN nodes n ON n.id = v.node_id
-            WHERE n.valid_until IS NULL AND n.type != 'episodic'
-            ORDER BY v.distance LIMIT 1"""
-        async with self._s.db.get_read_connection().execute(
-                sql, (sqlite_vec.serialize_float32([float(x) for x in emb]),)) as cur:
-            row = await cur.fetchone()
-        if not row:
-            return "insert", None
-        sim = 1.0 - row["distance"] ** 2 / 2.0
-        if sim >= settings.dedup_similarity_threshold:
-            return "skip", row["id"]
-        if sim >= settings.conflict_band_min:
-            answer = await self.llm.chat(
-                [{"role": "user",
-                  "content": CONFLICT_PROMPT.format(a=row["content"], b=content)}],
-                max_tokens=8, temperature=0.0)
-            word = answer.strip().casefold()
-            if word.startswith("same"):
-                return "skip", row["id"]
-            if word.startswith("contradicts"):
-                return "supersede", row["id"]
-        return "insert", None
-
-    async def _store(self, session_id: str, chunk: list[dict],
-                     facts: list[dict]) -> None:
+    async def _store(self, session_id, chunk, facts):
         if not facts:
             return
-        # No swallow of EmbeddingError: it propagates to consolidate_session,
-        # which returns False and leaves the session un-consolidated for retry.
         embs = await self._emb.embed_documents([f["content"] for f in facts])
 
         new_entity_ids: set[str] = set()
-        for fact, emb in zip(facts, embs):
+        for fact, emb in zip(facts, embs, strict=False):
             src_ids = [chunk[i]["id"] for i in fact["sources"]]
             event_time = min(chunk[i]["event_time"] for i in fact["sources"])
             eids = []
@@ -166,15 +135,28 @@ class Consolidator:
                     new_entity_ids.add(eid)
                 eids.append(eid)
 
-            action, target = await self._dedupe(emb, fact["content"])
+            # Pure vector similarity; LLM arbitration kept only for the
+            # narrow conflict band in the consolidator.
+            action, existing = await self._search.dedupe_candidate(
+                fact["content"], emb=emb)
             if action == "skip":
                 continue
-            if action == "supersede":
-                # link the freshly computed entities to the NEW node as well
-                await self._s.supersede_fact(
-                    target, content=fact["content"], confidence=fact["confidence"],
-                    embedding=emb, source_episode_ids=src_ids, entity_ids=eids)
-                continue
+            if action == "conflict":
+                answer = await self.llm.chat(
+                    [{"role": "user",
+                      "content": CONFLICT_PROMPT.format(
+                          a=existing["content"], b=fact["content"])}],
+                    max_tokens=8, temperature=0.0)
+                word = answer.strip().casefold()
+                if word.startswith("same"):
+                    continue
+                if word.startswith("contradicts"):
+                    await self._s.supersede_fact(
+                        existing["id"], node_type=fact["type"],
+                        content=fact["content"], confidence=fact["confidence"],
+                        embedding=emb, source_episode_ids=src_ids, entity_ids=eids)
+                    continue
+                # "different" -> insert as a new fact
             await self._s.create_fact(
                 content=fact["content"], node_type=fact["type"],
                 confidence=fact["confidence"], embedding=emb,
