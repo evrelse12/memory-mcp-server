@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     # --- LLM / embedding endpoints ---
     llm_api_url: str = "http://127.0.0.1:9931"
-    llm_model: str = "gemma-4-E4B-it-qat-UD-Q4_K_XL"
+    llm_model: str = "MiniCPM-V-4.7-35B-A3B-Q4"
     llm_timeout: float = Field(default=60.0, gt=0)
     llm_max_tokens: int = Field(default=2048, ge=64)
     embedding_api_url: str = "http://127.0.0.1:8081"
