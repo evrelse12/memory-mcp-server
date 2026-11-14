@@ -1,5 +1,5 @@
 # agents/maintenance.py
-"""Nightly maintenance: consolidation, decay, enrichment, causal, housekeeping."""
+"""Nightly maintenance: consolidation, dedup, decay, enrichment, housekeeping."""
 from __future__ import annotations
 
 import asyncio
@@ -19,15 +19,15 @@ logger = logging.getLogger(__name__)
 
 OVERDUE_S = 20 * 3600
 
-
 class MaintenanceService:
     def __init__(self, storage: Storage, consolidator, decay: DecayService,
-                 embedding: EmbeddingService, entity_index: EntityIndex):
+                 embedding: EmbeddingService, entity_index: EntityIndex, search):
         self._s = storage
         self._c = consolidator
         self._decay = decay
         self._emb = embedding
         self._ei = entity_index
+        self._search = search
         self._lock = asyncio.Lock()
 
     async def run_if_overdue(self) -> None:
@@ -45,6 +45,7 @@ class MaintenanceService:
             report = {}
             steps = (
                 ("consolidate", self._consolidate_pending),
+                ("dedup", self._dedup_step),
                 ("decay", self._decay_step),
                 ("enrich", self._enrich_entities),
                 ("housekeep", self._housekeep),
@@ -58,6 +59,18 @@ class MaintenanceService:
             await self._s.meta_set("last_maintenance_ts", str(int(time.time())))
             logger.info("nightly maintenance report: %s", report)
             return report
+
+    async def run_consolidation_tick(self) -> None:
+        """Consolidate idle sessions periodically; full maintenance stays nightly."""
+        if self._lock.locked():
+            return
+        async with self._lock:
+            try:
+                report = await self._consolidate_pending(int(time.time()))
+                if report["sessions"]:
+                    logger.info("consolidation tick: %s", report)
+            except Exception:
+                logger.exception("consolidation tick failed")
 
     async def _consolidate_pending(self, now: int) -> dict:
         """Only sessions with NEW episodes since last consolidation (no N writes)."""
@@ -82,6 +95,9 @@ class MaintenanceService:
             if await self._c.consolidate_session(sid, episodes=eps):
                 consolidated += 1
         return {"sessions": len(sids), "consolidated": consolidated}
+
+    async def _dedup_step(self, now: int) -> dict:
+        return await self._search.sweep_duplicates()
 
     async def _decay_step(self, now: int) -> dict:
         return await self._decay.run_night_job(now)

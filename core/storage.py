@@ -28,14 +28,11 @@ EDGE_COLS = ("id", "source_id", "target_id", "relation_type", "predicate",
 ENTITY_COLS = ("id", "name_norm", "canonical_name", "type", "aliases", "summary",
                "first_seen", "last_updated", "mention_count", "attributes")
 
-
 def _now() -> int:
     return int(time.time())
 
-
 def _ph(ids: Sequence[Any]) -> str:
     return ",".join("?" for _ in ids)
-
 
 class Storage:
     def __init__(self, db: Database, queue: WriteQueue):
@@ -122,7 +119,7 @@ class Storage:
 
     @staticmethod
     def _vec_stmt(node_id: str, embedding: Sequence[float]) -> tuple[str, tuple]:
-        # vec0 не поддерживает ON CONFLICT DO UPDATE, используем INSERT OR REPLACE
+        # vec0 does not support ON CONFLICT DO UPDATE; use INSERT OR REPLACE
         return ("""INSERT OR REPLACE INTO vec_nodes(node_id, embedding) VALUES (?,?)""",
                 (node_id, sqlite_vec.serialize_float32([float(x) for x in embedding])))
 
@@ -290,20 +287,17 @@ class Storage:
 
     async def merge_alias(self, entity_id: str, alias: str,
                           wait: bool = True) -> None:
-        """Read-merge-write aliases in Python; never overwrite the list."""
-        async with self._db.get_read_connection().execute(
-                "SELECT aliases, canonical_name FROM entities WHERE id=?",
-                (entity_id,)) as cur:
-            row = await cur.fetchone()
-        if not row:
-            return
-        aliases = json.loads(row["aliases"] or "[]")
-        if alias == row["canonical_name"] or alias in aliases:
-            return
-        aliases.append(alias)
-        await self._q.execute("UPDATE entities SET aliases=? WHERE id=?",
-                              (json.dumps(aliases, ensure_ascii=False), entity_id),
-                              wait=wait)
+        """Atomic append: no read-merge-write race between concurrent ensures.
+
+        Uses json_array_length instead of '$[#]' so it also works on SQLite < 3.31.
+        """
+        await self._q.execute(
+            """UPDATE entities
+               SET aliases = json_insert(aliases,
+                       '$[' || json_array_length(aliases) || ']', ?)
+               WHERE id = ? AND canonical_name <> ?
+                 AND NOT EXISTS (SELECT 1 FROM json_each(aliases) WHERE value = ?)""",
+            (alias, entity_id, alias, alias), wait=wait)
 
     def link_entities_stmts(self, node_id: str, entity_ids) -> list[tuple[str, tuple]]:
         return [("INSERT OR IGNORE INTO node_entities(node_id, entity_id) "
@@ -423,12 +417,11 @@ class Storage:
         await self._q.transaction(stmts, wait=wait)
         return nid
 
-
     async def supersede_fact(self, old_id, *, node_type: str = "semantic",
                              content, confidence=0.9,
                              embedding=None, source_episode_ids=(),
                              entity_ids=(), wait: bool = True) -> str:
-        """Preserve the old node's type; procedural/opinion stay their type."""
+        """Caller passes the OLD node's type; procedural/opinion stay their type."""
         now = _now()
         stmt, nid = self.node_stmt({
             "type": node_type, "content": content, "confidence": confidence,
@@ -448,6 +441,28 @@ class Storage:
             stmts.append(("UPDATE nodes SET needs_embedding=0 WHERE id=?", (nid,)))
         await self._q.transaction(stmts, wait=wait)
         return nid
+
+    async def merge_duplicate_facts(self, keeper_id: str, loser_id: str, *,
+                                    wait: bool = True) -> None:
+        """Retro-dedup: keeper inherits provenance/entity links, loser is soft-deleted."""
+        stmts = [
+            ("""INSERT INTO edges(id, source_id, target_id, relation_type, predicate,
+                                  weight, confidence, valid_from, valid_until,
+                                  evidence, created_at)
+                SELECT lower(hex(randomblob(16))), ?, e.target_id, e.relation_type,
+                       e.predicate, e.weight, e.confidence, e.valid_from, NULL,
+                       e.evidence, e.created_at
+                FROM edges e
+                WHERE e.source_id = ? AND e.relation_type = 'derived_from'
+                  AND e.valid_until IS NULL
+                ON CONFLICT DO NOTHING""", (keeper_id, loser_id)),
+            ("""INSERT OR IGNORE INTO node_entities(node_id, entity_id)
+                SELECT ?, entity_id FROM node_entities WHERE node_id = ?""",
+             (keeper_id, loser_id)),
+            ("UPDATE nodes SET valid_until=? WHERE id=? AND valid_until IS NULL",
+             (_now(), loser_id)),
+        ]
+        await self._q.transaction(stmts, wait=wait)
 
     # ------------------------------------------------------------ sessions
     async def mark_session_consolidated(self, session_id: str,
@@ -505,7 +520,7 @@ class Storage:
                              time_to: int | None = None,
                              limit: int = 20) -> list[dict]:
         """Last N episodes in chronological (ASC) order.
-        
+
         Two-step approach: first query gets last N by DESC, then Python sorts ASC.
         This is simpler and more reliable than a subquery with double ORDER BY.
         """
@@ -575,38 +590,9 @@ class Storage:
             "db_size_mb": db_size_mb,
         }
 
-        async with self._read.execute("""
-                SELECT COUNT(*) FROM nodes n
-                WHERE n.valid_until IS NULL AND n.type != 'episodic'
-                  AND NOT EXISTS (SELECT 1 FROM edges e
-                                  WHERE e.source_id=n.id OR e.target_id=n.id)
-                  AND NOT EXISTS (SELECT 1 FROM node_entities ne WHERE ne.node_id=n.id)
-            """) as cur:
-            orphans_row = await cur.fetchone()
-        orphans = orphans_row[0] if orphans_row else 0
-
-        async with self._read.execute("""
-                SELECT COUNT(*) FROM nodes WHERE needs_embedding=1
-                  AND valid_until IS NULL""") as cur:
-            vec_row = await cur.fetchone()
-        vec_available = vec_row[0] if vec_row else 0
-
-        db_size_mb = 0.0
-        if self._db.db_path.exists():
-            db_size_mb = round(self._db.db_path.stat().st_size / (1024 * 1024), 2)
-
-        return {
-            "nodes_by_type": nodes_by_type,
-            "edges_by_type": edges_by_type,
-            "entities_by_type": entities_by_type,
-            "orphans": orphans,
-            "vec_available": vec_available,
-            "db_size_mb": db_size_mb,
-        }
-
     async def provenance(self, node_id: str) -> tuple[list[dict], list[dict], list[dict]]:
         """Source episodes, supersedes chain, linked entities."""
-        # Soures (derived_from edges)
+        # Sources (derived_from edges)
         async with self._read.execute("""
                 SELECT n.* FROM nodes n
                 JOIN edges e ON e.target_id=n.id

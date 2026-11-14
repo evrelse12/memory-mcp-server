@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import struct
 import time
 from collections.abc import Sequence
 
@@ -23,17 +24,32 @@ from services.entity_index import EntityIndex
 logger = logging.getLogger(__name__)
 
 TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
-STOPWORDS = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
-             "is", "are", "was", "were", "what", "where", "when", "who",
-             "how", "why", "do", "does", "did", "i", "you", "my", "me"}
-
+CYR_RE = re.compile(r"[а-яё]")
+STOPWORDS_EN = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
+                "is", "are", "was", "were", "what", "where", "when", "who",
+                "how", "why", "do", "does", "did", "i", "you", "my", "me"}
+STOPWORDS_RU = {"что", "как", "где", "когда", "почему", "зачем", "кто", "какой",
+    "какая", "какие", "это", "этот", "эта", "эти", "тот", "там", "тут", "здесь",
+    "все", "весь", "вся", "еще", "уже", "или", "если", "чтобы", "тоже", "также",
+    "потому", "поэтому", "очень", "можно", "нужно", "надо", "был", "была",
+    "было", "были", "будет", "будут", "есть", "нет", "меня", "мне", "мой",
+    "моя", "мое", "мои", "твой", "твоя", "свой", "своя", "свое", "свои",
+    "него", "нее", "них", "ему", "ей", "ими", "вас", "вам", "вами", "нас",
+    "нам", "нами", "тебя", "тебе", "тобой", "при", "про", "под", "над",
+    "без", "для", "через", "после", "перед", "между", "только", "даже",
+    "вот", "ну", "да", "не", "ни"}
 
 def build_fts_query(text: str) -> str:
-    toks = [t for t in TOKEN_RE.findall(text.casefold()) if t not in STOPWORDS]
-    if not toks:
-        return ""
+    seen, toks = set(), []
+    for t in TOKEN_RE.findall(text.casefold()):
+        t = t.replace("ё", "е")
+        if t in STOPWORDS_EN or t in STOPWORDS_RU or t in seen:
+            continue
+        if CYR_RE.search(t) and len(t) >= 5:
+            t = t[: max(4, len(t) - 2)]   # crude RU stem: prefix covers word forms
+        seen.add(t)
+        toks.append(t)
     return " OR ".join(f'"{t}"*' for t in toks[:12])
-
 
 class SearchService:
     def __init__(self, storage: Storage, embedding: EmbeddingService,
@@ -108,6 +124,10 @@ class SearchService:
         Returns ('skip' | 'conflict' | 'insert', existing_node_or_None).
         Pass emb= when the caller already embedded the text to avoid a
         second HTTP round-trip per fact.
+
+        KNN overfetches (dedup_knn_k): episodes share vec_nodes, so a small k
+        could be entirely filled with episodes and miss the duplicate fact.
+        sqlite-vec is brute-force, so a large k is essentially free.
         """
         thr = (threshold if threshold is not None
                else settings.dedup_similarity_threshold)
@@ -122,25 +142,65 @@ class SearchService:
             where += " AND n.id != ?"
             params.append(exclude_id)
         sql = f"""
-            SELECT n.id, n.content, n.type, v.distance FROM (
+            SELECT n.id, n.content, n.type, n.decay_rate, v.distance FROM (
                 SELECT node_id, distance FROM vec_nodes
                 WHERE embedding MATCH ? AND k = ?
             ) v JOIN nodes n ON n.id = v.node_id
             WHERE {where} ORDER BY v.distance LIMIT 1"""
         async with self._s.db.get_read_connection().execute(
                 sql, (sqlite_vec.serialize_float32([float(x) for x in emb]),
-                      settings.knn_k, *params)) as cur:
+                      settings.dedup_knn_k, *params)) as cur:
             row = await cur.fetchone()
         if not row:
             return "insert", None
         # embeddings are L2-normalized, so cosine == 1 - d^2 / 2
         sim = 1.0 - row["distance"] ** 2 / 2.0
-        info = {"id": row["id"], "content": row["content"], "type": row["type"]}
+        info = {"id": row["id"], "content": row["content"],
+                "type": row["type"], "decay_rate": row["decay_rate"]}
         if sim >= thr:
             return "skip", info
         if sim >= settings.conflict_band_min:
             return "conflict", info
         return "insert", None
+
+    async def sweep_duplicates(self, limit: int | None = None) -> dict:
+        """Facts stored while the embedder was down never got deduped — fix that.
+
+        Vectors are read back from vec_nodes via point lookups (vec0 does not
+        support full scans without MATCH), so no re-embedding happens here.
+        Keeper = pinned fact if any, else the older one. Same-type only.
+        """
+        limit = settings.dedup_sweep_limit if limit is None else limit
+        if limit <= 0:
+            return {"checked": 0, "merged": 0}
+        async with self._s.db.get_read_connection().execute("""
+                SELECT id, content, type, decay_rate FROM nodes
+                WHERE type IN ('semantic','procedural','opinion')
+                  AND valid_until IS NULL
+                ORDER BY rid DESC LIMIT ?""", (limit,)) as cur:
+            rows = [dict(r) for r in await cur.fetchall()]
+        merged = 0
+        for r in rows:
+            if await self._s.get_node(r["id"]) is None:
+                continue                       # already merged earlier in this sweep
+            async with self._s.db.get_read_connection().execute(
+                    "SELECT embedding FROM vec_nodes WHERE node_id = ?",
+                    (r["id"],)) as cur:
+                vrow = await cur.fetchone()
+            if vrow is None:
+                continue                       # not embedded yet
+            emb = struct.unpack(f"<{settings.embedding_dim}f", vrow["embedding"])
+            action, existing = await self.dedupe_candidate(
+                r["content"], emb=emb, exclude_id=r["id"], node_types=(r["type"],))
+            if action != "skip" or not existing:
+                continue
+            keeper, loser = existing["id"], r["id"]
+            if r["decay_rate"] == 0.0 and existing["decay_rate"] != 0.0:
+                keeper, loser = loser, keeper  # never drop a pinned fact
+            await self._s.merge_duplicate_facts(keeper, loser)
+            await self._s.access_nodes([keeper])
+            merged += 1
+        return {"checked": len(rows), "merged": merged}
 
     # ---------------------------------------------------------- channels
     def _filters(self, node_types, time_from, time_to, include_episodes):
@@ -182,6 +242,10 @@ class SearchService:
             logger.warning("embedding unavailable, FTS-only mode")
             return []
         where, params = self._filters(node_types, t_from, t_to, include_episodes)
+        # Overfetch: the type/valid_until filter runs AFTER KNN, and episodes
+        # share vec_nodes — a small k could be all episodes. Brute-force scan
+        # makes a larger k cheap.
+        k = min(settings.knn_k * settings.vec_overfetch, 10000)
         sql = f"""
             SELECT n.id, v.distance FROM (
                 SELECT node_id, distance FROM vec_nodes
@@ -190,7 +254,7 @@ class SearchService:
             WHERE {where} ORDER BY v.distance LIMIT 40"""
         async with self._s.db.get_read_connection().execute(
                 sql, (sqlite_vec.serialize_float32([float(x) for x in emb]),
-                      settings.knn_k, *params)) as cur:
+                      k, *params)) as cur:
             rows = await cur.fetchall()
         return [(r["id"], 1.0 - r["distance"] ** 2 / 2.0) for r in rows]
 

@@ -2,12 +2,13 @@
 """Session consolidation: LLM extracts facts with per-fact sources and entities."""
 from __future__ import annotations
 
+import json
 import logging
 
 from agents.llm_client import LLMClient
 from config.settings import settings
 from core.storage import Storage
-from services.embedding import EmbeddingError, EmbeddingService
+from services.embedding import EmbeddingService
 from services.entity_index import EntityIndex
 from services.search import SearchService
 
@@ -34,7 +35,6 @@ CONFLICT_PROMPT = """Stored fact A: {a}
 New fact B: {b}
 Are A and B about the same topic? Answer exactly one word: same | contradicts | different"""
 
-
 class Consolidator:
     def __init__(self, storage: Storage, search: SearchService,
                  embedding: EmbeddingService, entity_index: EntityIndex,
@@ -54,6 +54,12 @@ class Consolidator:
             since = await self._s.session_consolidated_at(session_id)
             episodes = [n for n in await self._s.fetch_nodes_by_session(session_id, since)
                         if n["type"] == "episodic"]
+        if not settings.consolidate_assistant:
+            # Facts about the user come from the user's own words; assistant
+            # text stays in episodes (timeline) but never becomes a fact.
+            episodes = [e for e in episodes
+                        if json.loads(e["metadata"] or "{}").get("role", "user")
+                        != "assistant"]
         if not episodes:
             return True
         try:
@@ -123,17 +129,12 @@ class Consolidator:
             return
         embs = await self._emb.embed_documents([f["content"] for f in facts])
 
-        new_entity_ids: set[str] = set()
         for fact, emb in zip(facts, embs, strict=False):
             src_ids = [chunk[i]["id"] for i in fact["sources"]]
             event_time = min(chunk[i]["event_time"] for i in fact["sources"])
-            eids = []
-            for e in fact["entities"]:
-                existed = self._ei.resolve(e["name"])
-                eid = await self._ei.ensure(e["name"], e["type"])
-                if existed is None:
-                    new_entity_ids.add(eid)
-                eids.append(eid)
+            # ensure() embeds new entities itself (background, best-effort)
+            eids = [await self._ei.ensure(e["name"], e["type"])
+                    for e in fact["entities"]]
 
             # Pure vector similarity; LLM arbitration kept only for the
             # narrow conflict band in the consolidator.
@@ -152,7 +153,7 @@ class Consolidator:
                     continue
                 if word.startswith("contradicts"):
                     await self._s.supersede_fact(
-                        existing["id"], node_type=fact["type"],
+                        existing["id"], node_type=existing["type"],
                         content=fact["content"], confidence=fact["confidence"],
                         embedding=emb, source_episode_ids=src_ids, entity_ids=eids)
                     continue
@@ -162,11 +163,3 @@ class Consolidator:
                 confidence=fact["confidence"], embedding=emb,
                 session_id=session_id, event_time=event_time,
                 entity_ids=eids, source_episode_ids=src_ids)
-
-        for eid in new_entity_ids:
-            entity = await self._s.get_entity(eid)
-            if entity:
-                try:
-                    await self._ei.embed_entity(eid, entity["canonical_name"])
-                except EmbeddingError:
-                    logger.warning("entity embedding deferred: %s", eid)

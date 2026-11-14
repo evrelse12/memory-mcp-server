@@ -56,7 +56,15 @@ class Settings(BaseSettings):
     rrf_weight_vec: float = Field(default=1.0, ge=0.0)
     rrf_weight_graph: float = Field(default=1.0, ge=0.0)
     max_search_limit: int = Field(default=50, ge=1, le=200)
+
+    # --- Retrieval / dedup ---
     dedup_similarity_threshold: float = Field(default=0.92, gt=0.0, lt=1.0)
+    dedup_knn_k: int = Field(default=512, ge=1, le=10000)  # overfetch: episodes share vec_nodes
+    vec_overfetch: int = Field(default=8, ge=1, le=100)    # search KNN: k = knn_k * overfetch
+    dedup_sweep_limit: int = Field(default=200, ge=0)      # nightly retro-dedup, 0 = off
+    entity_match_threshold: float = Field(default=0.90, gt=0.0, lt=1.0)
+    entity_knn_k: int = Field(default=5, ge=1, le=50)
+    consolidate_assistant: bool = False
 
     log_level: str = "INFO"
 

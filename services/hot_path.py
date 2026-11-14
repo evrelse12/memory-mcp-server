@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 
 from config.settings import settings
 from core.storage import Storage
@@ -14,7 +15,6 @@ from services.entity_index import EntityIndex
 
 logger = logging.getLogger(__name__)
 
-
 class HotPath:
     def __init__(self, storage: Storage, embedding: EmbeddingService,
                  entity_index: EntityIndex):
@@ -22,6 +22,23 @@ class HotPath:
         self._emb = embedding
         self._ei = entity_index
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._auto_sid: str | None = None
+        self._auto_last: int = 0
+
+    def current_session(self, explicit: str | None = None) -> str:
+        """Host-provided chat id wins; otherwise rotate the auto session on idle.
+
+        Rotation makes the previous conversation consolidatable while the
+        process is still alive (no 03:00 wait, no restart needed).
+        """
+        if explicit:
+            return explicit
+        now = int(time.time())
+        if (self._auto_sid is None
+                or now - self._auto_last > settings.session_timeout_minutes * 60):
+            self._auto_sid = uuid.uuid4().hex[:12]
+        self._auto_last = now
+        return self._auto_sid
 
     def _lock(self, session_id: str) -> asyncio.Lock:
         # per-session lock: two parallel messages must not fork the temporal chain

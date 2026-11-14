@@ -7,7 +7,6 @@ import logging
 import os
 import signal
 import sys
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
@@ -42,7 +41,6 @@ SERVER_INSTRUCTIONS = (
     "replace contradictions with correct_fact; pin with confirm_fact; delete with "
     "forget_fact. Never guess from context alone.")
 
-
 @dataclass
 class AppContext:
     db: Database
@@ -57,11 +55,8 @@ class AppContext:
     maintenance: MaintenanceService
     tools: MemoryTools
     scheduler: AsyncIOScheduler | None
-    session_id: str | None = None
-
 
 ctx: AppContext | None = None
-
 
 async def build_context() -> AppContext:
     db = Database()
@@ -80,7 +75,7 @@ async def build_context() -> AppContext:
     decay = DecayService(storage)
     consolidator = Consolidator(storage, search, embedding, entity_index)
     maintenance = MaintenanceService(storage, consolidator, decay, embedding,
-                                     entity_index)
+                                     entity_index, search)
     tools = MemoryTools(storage, search, embedding, entity_index, decay)
 
     scheduler = AsyncIOScheduler()
@@ -88,11 +83,13 @@ async def build_context() -> AppContext:
                       hour=settings.consolidation_cron_hour,
                       minute=settings.consolidation_cron_minute,
                       id="nightly-maintenance", max_instances=1, coalesce=True)
+    scheduler.add_job(maintenance.run_consolidation_tick, "interval",
+                      minutes=settings.session_timeout_minutes,
+                      id="consolidation-tick", max_instances=1, coalesce=True)
     scheduler.start()
 
     app = AppContext(db, queue, storage, embedding, entity_index, hot_path,
-                     search, decay, consolidator, maintenance, tools, scheduler,
-                     session_id=uuid.uuid4().hex[:12])
+                     search, decay, consolidator, maintenance, tools, scheduler)
     await maintenance.run_if_overdue()   # spawns catch-up task via registry
     return app
 
@@ -127,10 +124,8 @@ async def teardown(app: AppContext | None) -> None:
         except (asyncio.TimeoutError, Exception):
             pass
 
-
 # Single-flight protection for concurrent signals
 _SHUTTING_DOWN = False
-
 
 async def _graceful_shutdown(sig: int) -> None:
     global ctx, _SHUTTING_DOWN
@@ -170,9 +165,7 @@ async def lifespan(server):
         await teardown(ctx)
         ctx = None
 
-
 mcp = FastMCP("memory-server", instructions=SERVER_INSTRUCTIONS, lifespan=lifespan)
-
 
 def tool_errors(fn):
     @wraps(fn)
@@ -186,19 +179,19 @@ def tool_errors(fn):
             raise ToolError(f"{fn.__name__} failed") from None
     return wrapper
 
-
 @mcp.tool()
 @tool_errors
 async def record_message(
     message: Annotated[str, Field(max_length=4000,
         description="The user's exact raw message for this turn")],
     role: Literal["user", "assistant"] = "user",
+    session_id: Annotated[str | None, Field(max_length=64,
+        description="Host chat/conversation id; omit for auto-managed session")] = None,
 ) -> dict:
     """Record a dialogue message as an episode. Call FIRST every turn."""
-    session = ctx.session_id or "default"
-    episode_id = await ctx.hot_path.record_message(session, message, role=role)
+    sid = ctx.hot_path.current_session(session_id)
+    episode_id = await ctx.hot_path.record_message(sid, message, role=role)
     return {"status": "recorded", "episode_id": episode_id}
-
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
@@ -224,9 +217,12 @@ async def remember_fact(
     pin: Annotated[bool, Field(description="Protect from forgetting")] = False,
     force: Annotated[bool, Field(
         description="Store even if a similar fact already exists")] = False,
+    session_id: Annotated[str | None, Field(max_length=64,
+        description="Host chat/conversation id; omit for auto-managed session")] = None,
 ) -> dict:
     """Store a durable fact. May return duplicate/similar instead of creating."""
-    ep = await ctx.storage.last_episode_id(ctx.session_id or "default")
+    sid = ctx.hot_path.current_session(session_id)
+    ep = await ctx.storage.last_episode_id(sid)
     return await ctx.tools.remember_fact(
         content, node_type=node_type, confidence=confidence, entities=entities,
         pin=pin, force=force, source_episode_ids=[ep] if ep else ())
@@ -238,13 +234,15 @@ async def correct_fact(
     new_content: Annotated[str, Field(max_length=1000,
         description="Replacement sentence, self-contained")],
     new_confidence: Annotated[float, Field(ge=0, le=1)] = 0.9,
+    session_id: Annotated[str | None, Field(max_length=64,
+        description="Host chat/conversation id; omit for auto-managed session")] = None,
 ) -> dict:
     """Replace an outdated fact when new info contradicts it."""
-    ep = await ctx.storage.last_episode_id(ctx.session_id or "default")
+    sid = ctx.hot_path.current_session(session_id)
+    ep = await ctx.storage.last_episode_id(sid)
     return await ctx.tools.correct_fact(
         old_node_id, new_content, new_confidence=new_confidence,
         source_episode_ids=[ep] if ep else ())
-
 
 @mcp.tool()
 @tool_errors
@@ -253,7 +251,6 @@ async def confirm_fact(
 ) -> dict:
     """Pin a fact permanently (confidence=1.0, no decay)."""
     return await ctx.tools.confirm_fact(node_id)
-
 
 @mcp.tool(annotations={"destructiveHint": True})
 @tool_errors
@@ -264,7 +261,6 @@ async def forget_fact(
     """Remove a fact (soft by default, hard on request)."""
     return await ctx.tools.forget_fact(node_id, hard=hard)
 
-
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def get_entity_info(
@@ -272,7 +268,6 @@ async def get_entity_info(
 ) -> dict:
     """Entity profile: summary, aliases, linked facts."""
     return await ctx.tools.get_entity_info(entity_name)
-
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
@@ -287,13 +282,11 @@ async def get_timeline(
                                         time_from=time_from, time_to=time_to,
                                         limit=limit)
 
-
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def memory_stats() -> dict:
     """Graph metrics and DB size."""
     return await ctx.tools.memory_stats()
-
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
@@ -303,7 +296,6 @@ async def explain_fact(
     """Provenance: source episodes, supersedes chain, entities."""
     return await ctx.tools.explain_fact(node_id)
 
-
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def weak_facts(
@@ -311,7 +303,6 @@ async def weak_facts(
 ) -> list[dict]:
     """Facts fading below effective confidence 0.3."""
     return await ctx.tools.weak_facts(limit=limit)
-
 
 def main() -> None:
     settings.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -323,7 +314,6 @@ def main() -> None:
     )
     logger.info("memory-mcp starting (stdio)")
     mcp.run(transport="stdio")
-
 
 if __name__ == "__main__":
     main()
