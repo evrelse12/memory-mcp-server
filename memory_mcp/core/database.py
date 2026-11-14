@@ -35,7 +35,7 @@ class Database:
         self._write = await aiosqlite.connect(self.db_path, isolation_level=None)
         self._write.row_factory = aiosqlite.Row
         self._read = await aiosqlite.connect(
-            f"file:{self.db_path}?mode=ro", uri=True)
+            f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
         self._read.row_factory = aiosqlite.Row
         await self._load_vec()
         await self._guard_schema_version()
