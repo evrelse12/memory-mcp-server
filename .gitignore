@@ -18,7 +18,8 @@ db/*
 *.db-wal
 *.db-shm
 libsqlite_vec0.a
-intent_cache.json
+.coverage
+htmlcov/
 .idea/
 .vscode/
 .DS_Store

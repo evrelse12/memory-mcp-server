@@ -11,8 +11,8 @@ import logging
 import math
 import time
 
-from config.settings import settings
-from core.storage import Storage
+from memory_mcp.config.settings import settings
+from memory_mcp.core.storage import Storage
 
 logger = logging.getLogger(__name__)
 

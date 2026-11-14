@@ -7,11 +7,11 @@ import logging
 import time
 import uuid
 
-from config.settings import settings
-from core.storage import Storage
-from core.tasks import spawn
-from services.embedding import EmbeddingError, EmbeddingService
-from services.entity_index import EntityIndex
+from memory_mcp.config.settings import settings
+from memory_mcp.core.storage import Storage
+from memory_mcp.core.tasks import spawn
+from memory_mcp.services.embedding import EmbeddingError, EmbeddingService
+from memory_mcp.services.entity_index import EntityIndex
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +55,8 @@ class HotPath:
                 "needs_embedding": True, "metadata": {"role": role},
             })
             stmts = [stmt]
-            # NOTE: temporal edges are no longer written. Nothing reads them
-            # (the causal step and the episode-graph walk were removed);
-            # ordering is recovered from (session_id, event_time, rid).
+            # NOTE: temporal edges are not written; ordering is recovered
+            # from (session_id, event_time, rid).
             for canon in self._ei.find_in_text(text):
                 eid = await self._ei.ensure(canon)
                 stmts += self._s.link_entities_stmts(nid, [eid])
@@ -71,6 +70,3 @@ class HotPath:
             await self._s.insert_embedding_and_clear_flag(nid, emb)
         except EmbeddingError:
             logger.warning("episode embedding deferred: %s", nid)
-
-    def last_episode(self, session_id: str) -> str | None:
-        return None  # superseded by storage.last_episode_id; kept for compatibility

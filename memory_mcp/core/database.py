@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-import platform
 from pathlib import Path
 
 import aiosqlite
 import sqlite_vec
 
-from config.settings import settings
+from memory_mcp.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -48,13 +47,11 @@ class Database:
 
     async def _load_vec(self) -> None:
         """Load sqlite-vec extension into BOTH connections."""
-        ext_dir = Path(sqlite_vec.__file__).parent
-        ext_name = "vec0" if platform.system() != "Windows" else "vec0.dll"
-        ext_path = ext_dir / ext_name
+        ext_path = sqlite_vec.loadable_path()
         await self._write.enable_load_extension(True)
         await self._read.enable_load_extension(True)
-        await self._write.load_extension(str(ext_path))
-        await self._read.load_extension(str(ext_path))
+        await self._write.load_extension(ext_path)
+        await self._read.load_extension(ext_path)
         logger.info("sqlite-vec loaded into both connections: %s", ext_path)
 
     async def _guard_schema_version(self) -> None:
@@ -70,7 +67,7 @@ class Database:
             await self._read.close()
             raise RuntimeError(
                 f"incompatible schema v{version} (expected v{SCHEMA_VERSION}); "
-                f"run scripts/migrate_v1_to_v2.py before starting")
+                f"back up the DB and migrate manually (no auto-migrations yet)")
 
     async def _create_schema(self) -> None:
         w = self._write
@@ -149,16 +146,6 @@ class Database:
                 CREATE TABLE sessions (
                     session_id TEXT PRIMARY KEY,
                     consolidated_at INTEGER
-                )
-            """):
-                pass
-
-            async with w.execute("""
-                CREATE TABLE causal_checked (
-                    cause_id TEXT NOT NULL,
-                    effect_id TEXT NOT NULL,
-                    checked_at INTEGER NOT NULL,
-                    PRIMARY KEY (cause_id, effect_id)
                 )
             """):
                 pass

@@ -5,7 +5,7 @@ import json
 import pytest
 from fastmcp import Client
 
-from mcp_server import server
+from memory_mcp.mcp_server import server
 
 
 def _data(res):
@@ -66,7 +66,7 @@ async def test_stats_keys(fresh_db):
 
 def test_decay_uses_last_access():
     """A recently used old fact must NOT look expired (Ebbinghaus reset)."""
-    from services.decay import DecayService
+    from memory_mcp.services.decay import DecayService
     eff = DecayService.effective_confidence
     assert eff(0.9, 0.1, 70 * 86400) < 0.05
     assert eff(0.9, 0.1, 1 * 86400) > 0.5

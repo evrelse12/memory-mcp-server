@@ -7,7 +7,7 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+_ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
 class Settings(BaseSettings):
@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     consolidate_assistant: bool = False
 
     log_level: str = "INFO"
+    log_to_file: bool = False
 
     @property
     def db_file(self) -> Path:

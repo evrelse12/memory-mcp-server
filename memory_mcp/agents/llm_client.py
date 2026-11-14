@@ -10,7 +10,7 @@ from collections.abc import Sequence
 
 import httpx
 
-from config.settings import settings
+from memory_mcp.config.settings import settings
 
 logger = logging.getLogger(__name__)
 

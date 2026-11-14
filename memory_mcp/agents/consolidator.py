@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import logging
 
-from agents.llm_client import LLMClient
-from config.settings import settings
-from core.storage import Storage
-from services.embedding import EmbeddingService
-from services.entity_index import EntityIndex
-from services.search import SearchService
+from memory_mcp.agents.llm_client import LLMClient
+from memory_mcp.config.settings import settings
+from memory_mcp.core.storage import Storage
+from memory_mcp.services.embedding import EmbeddingService
+from memory_mcp.services.entity_index import EntityIndex
+from memory_mcp.services.search import SearchService
 
 logger = logging.getLogger(__name__)
 

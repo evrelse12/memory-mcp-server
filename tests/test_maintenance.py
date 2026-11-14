@@ -3,8 +3,8 @@
 
 import pytest
 
-from mcp_server import server
-from services import embedding as emb_mod
+from memory_mcp.mcp_server import server
+from memory_mcp.services import embedding as emb_mod
 
 
 class FakeLLM:
@@ -36,7 +36,7 @@ async def _fake_call(self, text, *, prefix=""):
 @pytest.fixture
 def patched_services(monkeypatch):
     """Swap LLM client and embedding network calls for offline determinism."""
-    import agents.consolidator as cons_mod
+    import memory_mcp.agents.consolidator as cons_mod
     monkeypatch.setattr(cons_mod, "LLMClient", lambda: FakeLLM())
     # Patch BOTH the batch and single methods
     monkeypatch.setattr(emb_mod.EmbeddingService, "_call_batch", _fake_call_batch)
@@ -61,7 +61,7 @@ async def test_consolidation_extracts_and_marks(fresh_db, patched_services):
 @pytest.mark.asyncio
 async def test_consolidation_retries_on_embedding_failure(fresh_db, monkeypatch):
     """EmbeddingError must NOT mark the session consolidated (retry next run)."""
-    import agents.consolidator as cons_mod
+    import memory_mcp.agents.consolidator as cons_mod
     monkeypatch.setattr(cons_mod, "LLMClient", lambda: FakeLLM())
     # leave the real (unreachable) embedding endpoint -> EmbeddingError on demand
 

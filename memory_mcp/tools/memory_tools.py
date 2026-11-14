@@ -1,4 +1,4 @@
-# tools/memory_tools.py
+# memory_mcp/tools/memory_tools.py
 """Tool-layer orchestration over storage/search; auto entity extraction internal."""
 from __future__ import annotations
 
@@ -6,20 +6,18 @@ import logging
 import time
 from collections.abc import Sequence
 
-from core.storage import Storage
-from services.decay import DecayService
-from services.embedding import EmbeddingError, EmbeddingService
-from services.entity_index import EntityIndex
-from services.search import SearchService
+from memory_mcp.core.storage import Storage
+from memory_mcp.services.decay import DAY, DecayService
+from memory_mcp.services.embedding import EmbeddingError, EmbeddingService
+from memory_mcp.services.entity_index import EntityIndex
+from memory_mcp.services.search import SearchService
 
 logger = logging.getLogger(__name__)
 
 FACT_TYPES = {"semantic", "procedural", "opinion"}
 
-
 class MemoryToolError(Exception):
     """User-facing tool error (mapped to MCP ToolError by the server)."""
-
 
 class MemoryTools:
     def __init__(self, storage: Storage, search: SearchService,
@@ -32,10 +30,9 @@ class MemoryTools:
         self._decay = decay
 
     async def search_memory(self, query: str, *, node_types=None,
-                            entity_ids=None, time_from=None, time_to=None,
+                            time_from=None, time_to=None,
                             limit: int = 10,
                             include_episodes: bool = False) -> list[dict]:
-        # entity_ids kept in signature for tool compatibility, but ignored
         return await self._search.search(
             query, limit=limit, node_types=node_types,
             time_from=time_from, time_to=time_to,
@@ -51,7 +48,6 @@ class MemoryTools:
             raise MemoryToolError(f"bad node_type: {node_type!r}")
         confidence = min(1.0, max(0.0, float(confidence)))
 
-        # Embed ONCE; reuse the vector for dedupe and for storage.
         emb = None
         try:
             emb = await self._emb.embed_document(content)
@@ -61,7 +57,6 @@ class MemoryTools:
         action, existing = await self._search.dedupe_candidate(content, emb=emb)
 
         if action == "skip" and existing and not force:
-            # A repeated mention confirms the fact: reinforce it.
             await self._s.access_nodes([existing["id"]])
             pinned = False
             if pin:
@@ -74,7 +69,6 @@ class MemoryTools:
                     "hint": "call correct_fact if the new text contradicts it"}
 
         if action == "conflict" and existing and not force:
-            # Conflict band: let the model choose replace vs keep-both.
             return {"status": "similar",
                     "existing_id": existing["id"],
                     "existing_content": existing["content"],
@@ -147,13 +141,11 @@ class MemoryTools:
                            time_from=None, time_to=None,
                            limit: int = 20) -> list[dict]:
         eid = self._ei.resolve(entity_name) if entity_name else None
-        rows = await self._s.fetch_timeline(
+        return await self._s.fetch_timeline(
             entity_id=eid, time_from=time_from, time_to=time_to, limit=limit)
-        return rows
 
     async def memory_stats(self) -> dict:
         s = await self._s.stats()
-        # vec_available = is the embedding service answering RIGHT NOW?
         try:
             await self._emb.embed_query("ping")
             vec_available = True
@@ -170,8 +162,26 @@ class MemoryTools:
                 "superseded": superseded, "entities": ents}
 
     async def weak_facts(self, limit: int = 20) -> list[dict]:
-        """Facts whose EFFECTIVE confidence (from last access) is below 0.3."""
+        """Facts whose EFFECTIVE confidence (from last access) is below 0.3.
+
+        SQL path when SQLite has math functions; Python fallback otherwise.
+        """
         now = int(time.time())
+        thr = 0.3
+        if self._s.db.has_math_functions:
+            async with self._s.db.get_read_connection().execute("""
+                    SELECT id, type, content, eff FROM (
+                        SELECT id, type, content,
+                               confidence * EXP(-decay_rate *
+                                   POWER((? - COALESCE(last_accessed, created_at)) / ?, ?)) AS eff
+                        FROM nodes
+                        WHERE type IN ('semantic','procedural','opinion')
+                          AND valid_until IS NULL
+                    ) WHERE eff < ? ORDER BY eff LIMIT ?""",
+                    (now, DAY, self._decay_exponent(), thr, limit)) as cur:
+                return [{"id": r["id"], "type": r["type"], "content": r["content"],
+                         "effective_confidence": round(r["eff"], 4)}
+                        for r in await cur.fetchall()]
         async with self._s.db.get_read_connection().execute("""
                 SELECT id, type, content, confidence, decay_rate,
                        created_at, last_accessed FROM nodes
@@ -183,9 +193,14 @@ class MemoryTools:
             idle = now - (r["last_accessed"] or r["created_at"])
             eff = self._decay.effective_confidence(
                 r["confidence"], r["decay_rate"], idle)
-            if eff < 0.3:
+            if eff < thr:
                 out.append({"id": r["id"], "type": r["type"],
                             "content": r["content"],
                             "effective_confidence": round(eff, 4)})
         out.sort(key=lambda d: d["effective_confidence"])
         return out[:limit]
+
+    @staticmethod
+    def _decay_exponent() -> float:
+        from memory_mcp.config.settings import settings
+        return settings.decay_exponent

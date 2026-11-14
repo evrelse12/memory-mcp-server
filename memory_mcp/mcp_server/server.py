@@ -10,6 +10,7 @@ import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import wraps
+from logging.handlers import RotatingFileHandler
 from typing import Annotated, Literal
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -17,19 +18,19 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import Field
 
-from agents.consolidator import Consolidator
-from agents.maintenance import MaintenanceService
-from config.settings import settings
-from core.database import Database
-from core.storage import Storage
-from core.tasks import drain as drain_tasks
-from core.write_queue import WriteQueue
-from services.decay import DecayService
-from services.embedding import EmbeddingService
-from services.entity_index import EntityIndex
-from services.hot_path import HotPath
-from services.search import SearchService
-from tools.memory_tools import MemoryToolError, MemoryTools
+from memory_mcp.agents.consolidator import Consolidator
+from memory_mcp.agents.maintenance import MaintenanceService
+from memory_mcp.config.settings import settings
+from memory_mcp.core.database import Database
+from memory_mcp.core.storage import Storage
+from memory_mcp.core.tasks import drain as drain_tasks
+from memory_mcp.core.write_queue import WriteQueue
+from memory_mcp.services.decay import DecayService
+from memory_mcp.services.embedding import EmbeddingService
+from memory_mcp.services.entity_index import EntityIndex
+from memory_mcp.services.hot_path import HotPath
+from memory_mcp.services.search import SearchService
+from memory_mcp.tools.memory_tools import MemoryToolError, MemoryTools
 
 logger = logging.getLogger(__name__)
 
@@ -305,12 +306,15 @@ async def weak_facts(
     return await ctx.tools.weak_facts(limit=limit)
 
 def main() -> None:
-    settings.log_file.parent.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    if settings.log_to_file:
+        settings.log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(
+            settings.log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"))
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
-        handlers=[logging.StreamHandler(sys.stderr),
-                  logging.FileHandler(settings.log_file)],
+        handlers=handlers,
     )
     logger.info("memory-mcp starting (stdio)")
     mcp.run(transport="stdio")

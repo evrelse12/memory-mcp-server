@@ -5,10 +5,10 @@ import json
 
 import pytest
 
-from config.settings import settings
-from core.tasks import drain
-from mcp_server import server
-from services.search import build_fts_query
+from memory_mcp.config.settings import settings
+from memory_mcp.core.tasks import drain
+from memory_mcp.mcp_server import server
+from memory_mcp.services.search import build_fts_query
 
 
 class FakeLLM:
@@ -35,8 +35,8 @@ def _vec_for(text):
 
 @pytest.fixture
 def patched(monkeypatch):
-    import agents.consolidator as cons_mod
-    from services import embedding as emb_mod
+    import memory_mcp.agents.consolidator as cons_mod
+    from memory_mcp.services import embedding as emb_mod
     monkeypatch.setattr(cons_mod, "LLMClient", lambda: FakeLLM())
 
     async def _call(self, text, *, prefix=""):

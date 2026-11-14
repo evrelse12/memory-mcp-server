@@ -21,7 +21,7 @@ def anyio_backend():
 @pytest.fixture
 def fresh_db(tmp_path, monkeypatch):
     """Each test gets its own database directory; no shared state between tests."""
-    from config import settings as s
+    from memory_mcp.config import settings as s
     monkeypatch.setattr(s.settings, "data_dir", tmp_path)
     (tmp_path / "db").mkdir(parents=True, exist_ok=True)
     (tmp_path / "logs").mkdir(parents=True, exist_ok=True)

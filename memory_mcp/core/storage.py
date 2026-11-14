@@ -11,9 +11,9 @@ from typing import Any
 
 import sqlite_vec
 
-from config.settings import settings
-from core.database import Database
-from core.write_queue import WriteQueue
+from memory_mcp.config.settings import settings
+from memory_mcp.core.database import Database
+from memory_mcp.core.write_queue import WriteQueue
 
 logger = logging.getLogger(__name__)
 
@@ -479,21 +479,6 @@ class Storage:
                 (session_id,)) as cur:
             row = await cur.fetchone()
         return row["consolidated_at"] if row else None
-
-    # ------------------------------------------------------------ causal checks
-    async def mark_causal_checked(self, cause_id: str, effect_id: str,
-                                  ts: int | None = None, *,
-                                  wait: bool = True) -> int | None:
-        return await self._q.execute(
-            "INSERT OR IGNORE INTO causal_checked(cause_id, effect_id, checked_at) "
-            "VALUES (?,?,?)", (cause_id, effect_id, ts or _now()), wait=wait)
-
-    async def is_causal_checked(self, cause_id: str, effect_id: str) -> bool:
-        async with self._read.execute(
-                "SELECT 1 FROM causal_checked WHERE cause_id=? AND effect_id=?",
-                (cause_id, effect_id)) as cur:
-            row = await cur.fetchone()
-        return row is not None
 
     # ------------------------------------------------------------ meta
     async def meta_get(self, key: str) -> str | None:

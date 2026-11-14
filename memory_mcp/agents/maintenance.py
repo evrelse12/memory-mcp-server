@@ -7,13 +7,13 @@ import json
 import logging
 import time
 
-from agents.llm_client import LLMError
-from config.settings import settings
-from core.storage import Storage
-from core.tasks import spawn
-from services.decay import DecayService
-from services.embedding import EmbeddingError, EmbeddingService
-from services.entity_index import EntityIndex
+from memory_mcp.agents.llm_client import LLMError
+from memory_mcp.config.settings import settings
+from memory_mcp.core.storage import Storage
+from memory_mcp.core.tasks import spawn
+from memory_mcp.services.decay import DecayService
+from memory_mcp.services.embedding import EmbeddingError, EmbeddingService
+from memory_mcp.services.entity_index import EntityIndex
 
 logger = logging.getLogger(__name__)
 

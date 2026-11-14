@@ -6,6 +6,7 @@ LAST ACCESS (falls back to created_at), so recently used facts stay on top.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import struct
@@ -14,12 +15,12 @@ from collections.abc import Sequence
 
 import sqlite_vec
 
-from config.settings import settings
-from core.storage import Storage
-from core.tasks import spawn
-from services.decay import DecayService
-from services.embedding import EmbeddingError, EmbeddingService
-from services.entity_index import EntityIndex
+from memory_mcp.config.settings import settings
+from memory_mcp.core.storage import Storage
+from memory_mcp.core.tasks import spawn
+from memory_mcp.services.decay import DecayService
+from memory_mcp.services.embedding import EmbeddingError, EmbeddingService
+from memory_mcp.services.entity_index import EntityIndex
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +69,12 @@ class SearchService:
         limit = min(limit, settings.max_search_limit)
         now = int(time.time())
 
-        fts = await self._fts(query, node_types, time_from, time_to, include_episodes)
-        vec = await self._vec(query, node_types, time_from, time_to, include_episodes)
+        fts, vec, entity = await asyncio.gather(
+            self._fts(query, node_types, time_from, time_to, include_episodes),
+            self._vec(query, node_types, time_from, time_to, include_episodes),
+            self._entity(query, node_types))
         seeds = [i for i, _ in (vec[:3] or fts[:3])]
         graph = await self._graph(seeds, node_types)
-        entity = await self._entity(query, node_types)
 
         fused = self._rrf({"fts": fts, "vec": vec, "graph": graph,
                            "entity": entity}, limit)
