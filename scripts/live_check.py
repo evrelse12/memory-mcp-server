@@ -26,10 +26,11 @@ os.environ["MEMORY_LOG_PATH"] = str(Path(TMP) / "logs" / "memory.log")
 os.environ["MEMORY_LOG_LEVEL"] = "WARNING"
 # NOTE: offline endpoints are NOT set — we want the real .env services.
 
-from fastmcp import Client                       # noqa: E402
+from fastmcp import Client  # noqa: E402
+
 from memory_mcp.config.settings import settings  # noqa: E402
-from memory_mcp.core.tasks import drain          # noqa: E402
-from memory_mcp.mcp_server import server         # noqa: E402
+from memory_mcp.core.tasks import drain  # noqa: E402
+from memory_mcp.mcp_server import server  # noqa: E402
 
 RESULTS = []
 
@@ -55,12 +56,14 @@ async def run():
             await ctx.embedding.embed_query("ping")
             check("embedding service up", True, settings.embedding_api_url)
         except Exception as e:
-            check("embedding service up", False, str(e)); raise SystemExit(2)
+            check("embedding service up", False, str(e))
+            raise SystemExit(2) from e
         try:
             await ctx.consolidator.llm.chat([{"role": "user", "content": "ping"}], max_tokens=4)
             check("LLM service up", True, settings.llm_api_url)
         except Exception as e:
-            check("LLM service up", False, str(e)); raise SystemExit(2)
+            check("LLM service up", False, str(e))
+            raise SystemExit(2) from e
 
         # --- dedup on real nomic vectors ---
         r = await ctx.tools.remember_fact("Пользователь работает в Яндексе")
@@ -94,7 +97,7 @@ async def run():
         await drain(timeout=10)
         va = await ctx.embedding.embed_document("Google")
         vb = await ctx.embedding.embed_document("Гугл")
-        sim = sum(a * b for a, b in zip(va, vb))
+        sim = sum(a * b for a, b in zip(va, vb, strict=False))
         eid2 = await ctx.entity_index.ensure("Гугл")
         info("entity cosine Google/Гугл", f"{sim:.3f} (threshold {settings.entity_match_threshold})")
         check("entity alias merge", eid2 == eid1,
@@ -118,7 +121,8 @@ async def run():
 
         # --- session rotation ---
         hp = ctx.hot_path
-        s1 = hp.current_session(); s2 = hp.current_session()
+        s1 = hp.current_session()
+        s2 = hp.current_session()
         hp._auto_last -= settings.session_timeout_minutes * 60 + 1
         s3 = hp.current_session()
         check("session rotation", s1 == s2 and s3 != s1 and hp.current_session("chat-42") == "chat-42")
