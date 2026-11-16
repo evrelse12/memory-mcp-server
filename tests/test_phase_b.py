@@ -1,5 +1,6 @@
 # tests/test_phase_b.py
 """Phase B: MCP resources — static endpoints and URI templates."""
+
 import pytest
 from fastmcp import Client
 
@@ -15,12 +16,17 @@ async def test_resources_and_templates_listed(fresh_db):
     async with server.lifespan(server.mcp):
         async with Client(server.mcp) as c:
             uris = " ".join(str(r.uri) for r in await c.list_resources())
-            for expected in ("memory://user/profile", "memory://user/constraints",
-                             "memory://user/preferences", "memory://episodes/recent"):
+            for expected in (
+                "memory://user/profile",
+                "memory://user/constraints",
+                "memory://user/preferences",
+                "memory://episodes/recent",
+            ):
                 assert expected in uris
             templates = " ".join(
                 getattr(t, "uri_template", None) or t.uriTemplate
-                for t in await c.list_resource_templates())
+                for t in await c.list_resource_templates()
+            )
             assert "memory://entities/{entity_id}" in templates
             assert "memory://session/{session_id}/summary" in templates
 
@@ -32,15 +38,12 @@ async def test_profile_and_directive_resources(fresh_db):
         p = await ctx.tools.remember_fact("User works at Yandex")
         await ctx.tools.confirm_fact(p["node_id"])
         await ctx.tools.remember_fact("Never use Java in this project", constraint=True)
-        o = await ctx.tools.remember_fact("User dislikes verbose answers",
-                                          node_type="opinion")
+        o = await ctx.tools.remember_fact("User dislikes verbose answers", node_type="opinion")
         await ctx.tools.confirm_fact(o["node_id"])
         async with Client(server.mcp) as c:
             assert "Yandex" in _text(await c.read_resource("memory://user/profile"))
-            assert "Never use Java" in _text(
-                await c.read_resource("memory://user/constraints"))
-            assert "verbose answers" in _text(
-                await c.read_resource("memory://user/preferences"))
+            assert "Never use Java" in _text(await c.read_resource("memory://user/constraints"))
+            assert "verbose answers" in _text(await c.read_resource("memory://user/preferences"))
 
 
 @pytest.mark.asyncio

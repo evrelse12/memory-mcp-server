@@ -1,5 +1,6 @@
 # config/settings.py
 """All tunables in one place; every path is derived, nothing hardcoded."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,10 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
 
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_file=str(_ENV_FILE), env_prefix="MEMORY_", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_file=str(_ENV_FILE), env_prefix="MEMORY_", extra="ignore")
 
     # --- Data locations (derived, overridable) ---
     data_dir: Path = Field(default=Path.home() / "memory")
@@ -68,8 +68,8 @@ class Settings(BaseSettings):
 
     # --- Retrieval / dedup ---
     dedup_knn_k: int = Field(default=512, ge=1, le=10000)  # overfetch: episodes share vec_nodes
-    vec_overfetch: int = Field(default=8, ge=1, le=100)    # search KNN: k = knn_k * overfetch
-    dedup_sweep_limit: int = Field(default=200, ge=0)      # nightly retro-dedup, 0 = off
+    vec_overfetch: int = Field(default=8, ge=1, le=100)  # search KNN: k = knn_k * overfetch
+    dedup_sweep_limit: int = Field(default=200, ge=0)  # nightly retro-dedup, 0 = off
     entity_match_threshold: float = Field(default=0.90, gt=0.0, lt=1.0)
     entity_knn_k: int = Field(default=5, ge=1, le=50)
 
@@ -88,5 +88,6 @@ class Settings(BaseSettings):
     @classmethod
     def _upper(cls, v: str) -> str:
         return v.upper()
+
 
 settings = Settings()

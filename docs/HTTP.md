@@ -35,6 +35,7 @@ Run: `./venv/bin/memory-mcp` → `http://127.0.0.1:8090/mcp`.
 
 ```python
 from fastmcp import Client
+
 async with Client("http://127.0.0.1:8090/mcp", auth="<token>") as c:
     print(await c.call_tool("memory_stats", {}))
 ```

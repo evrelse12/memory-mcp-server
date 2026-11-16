@@ -1,4 +1,5 @@
 """memory-mcp: long-term memory MCP server."""
+
 import os
 
 # Runtime defaults for FastMCP, applied before fastmcp is imported.

@@ -1,5 +1,6 @@
 # core/write_queue.py
 """Single-writer queue: batched commits, savepoint per op, waits by default."""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,8 +21,7 @@ class WriteOp:
 
 
 class WriteQueue:
-    def __init__(self, conn: aiosqlite.Connection, *, batch: int = 64,
-                 maxsize: int = 4096):
+    def __init__(self, conn: aiosqlite.Connection, *, batch: int = 64, maxsize: int = 4096):
         self._conn = conn
         self._batch = batch
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
@@ -45,13 +45,11 @@ class WriteQueue:
         await self._queue.put(WriteOp(stmts, fut, many=many, raw=raw))
         return fut
 
-    async def transaction(self, stmts, *, wait: bool = True,
-                          many: bool = False):
+    async def transaction(self, stmts, *, wait: bool = True, many: bool = False):
         fut = await self._enqueue(list(stmts), wait=wait, many=many, raw=False)
         return await fut if fut else None
 
-    async def execute(self, sql, params=(), *, wait: bool = True,
-                      many: bool = False):
+    async def execute(self, sql, params=(), *, wait: bool = True, many: bool = False):
         return await self.transaction([(sql, params)], wait=wait, many=many)
 
     async def raw(self, sql, params=(), *, wait: bool = True):
@@ -115,8 +113,11 @@ class WriteQueue:
                 await self._conn.execute("SAVEPOINT op")
                 n = 0
                 for sql, params in op.stmts:
-                    cur = (await self._conn.executemany(sql, params)) if op.many \
+                    cur = (
+                        (await self._conn.executemany(sql, params))
+                        if op.many
                         else (await self._conn.execute(sql, params))
+                    )
                     n += cur.rowcount
                     await cur.close()
                 await self._conn.execute("RELEASE op")

@@ -1,5 +1,6 @@
 # agents/consolidator.py
 """Session consolidation: LLM extracts facts with per-fact sources and entities."""
+
 from __future__ import annotations
 
 import json
@@ -36,10 +37,16 @@ CONFLICT_PROMPT = """Stored fact A: {a}
 New fact B: {b}
 Are A and B about the same topic? Answer exactly one word: same | contradicts | different"""
 
+
 class Consolidator:
-    def __init__(self, storage: Storage, search: SearchService,
-                 embedding: EmbeddingService, entity_index: EntityIndex,
-                 llm: LLMClient | None = None):
+    def __init__(
+        self,
+        storage: Storage,
+        search: SearchService,
+        embedding: EmbeddingService,
+        entity_index: EntityIndex,
+        llm: LLMClient | None = None,
+    ):
         self._s = storage
         self._search = search
         self._emb = embedding
@@ -49,18 +56,24 @@ class Consolidator:
     async def close(self) -> None:
         await self.llm.close()
 
-    async def consolidate_session(self, session_id: str,
-                                  episodes: list[dict] | None = None) -> bool:
+    async def consolidate_session(
+        self, session_id: str, episodes: list[dict] | None = None
+    ) -> bool:
         if episodes is None:
             since = await self._s.session_consolidated_at(session_id)
-            episodes = [n for n in await self._s.fetch_nodes_by_session(session_id, since)
-                        if n["type"] == "episodic"]
+            episodes = [
+                n
+                for n in await self._s.fetch_nodes_by_session(session_id, since)
+                if n["type"] == "episodic"
+            ]
         if not settings.consolidate_assistant:
             # Facts about the user come from the user's own words; assistant
             # text stays in episodes (timeline) but never becomes a fact.
-            episodes = [e for e in episodes
-                        if json.loads(e["metadata"] or "{}").get("role", "user")
-                        != "assistant"]
+            episodes = [
+                e
+                for e in episodes
+                if json.loads(e["metadata"] or "{}").get("role", "user") != "assistant"
+            ]
         if not episodes:
             return True
         try:
@@ -92,12 +105,14 @@ class Consolidator:
 
     async def _extract(self, chunk: list[dict]) -> list[dict]:
         text = "\n".join(f"[{i}] {ep['content']}" for i, ep in enumerate(chunk))
-        prompt = (PROMPT
-                  .replace("{max_facts}", str(settings.max_facts_per_llm_call))
-                  .replace("{episodes}", text))
+        prompt = PROMPT.replace("{max_facts}", str(settings.max_facts_per_llm_call)).replace(
+            "{episodes}", text
+        )
         data = await self.llm.chat_json(
             [{"role": "user", "content": prompt}],
-            max_tokens=settings.llm_max_tokens, temperature=0.2)
+            max_tokens=settings.llm_max_tokens,
+            temperature=0.2,
+        )
         return self._validate(data, len(chunk)) if data else []
 
     @staticmethod
@@ -114,15 +129,23 @@ class Consolidator:
                 conf = min(1.0, max(0.0, float(f.get("confidence", 0.8))))
             except (TypeError, ValueError):
                 conf = 0.8
-            sources = [i for i in f.get("sources") or []
-                       if isinstance(i, int) and 0 <= i < n_eps] or list(range(n_eps))
+            sources = [
+                i for i in f.get("sources") or [] if isinstance(i, int) and 0 <= i < n_eps
+            ] or list(range(n_eps))
             ents = []
             for e in f.get("entities") or []:
                 if isinstance(e, dict) and str(e.get("name") or "").strip():
                     et = e.get("type") if e.get("type") in ENTITY_TYPES else "concept"
                     ents.append({"name": str(e["name"]).strip()[:120], "type": et})
-            out.append({"content": content, "type": ftype, "confidence": conf,
-                        "sources": sources, "entities": ents})
+            out.append(
+                {
+                    "content": content,
+                    "type": ftype,
+                    "confidence": conf,
+                    "sources": sources,
+                    "entities": ents,
+                }
+            )
         return out
 
     async def _store(self, session_id, chunk, facts):
@@ -134,39 +157,54 @@ class Consolidator:
             src_ids = [chunk[i]["id"] for i in fact["sources"]]
             event_time = min(chunk[i]["event_time"] for i in fact["sources"])
             # ensure() embeds new entities itself (background, best-effort)
-            eids = [await self._ei.ensure(e["name"], e["type"])
-                    for e in fact["entities"]]
+            eids = [await self._ei.ensure(e["name"], e["type"]) for e in fact["entities"]]
 
             # Pure vector similarity; LLM arbitration kept only for the
             # narrow conflict band in the consolidator.
-            action, existing = await self._search.dedupe_candidate(
-                fact["content"], emb=emb)
+            action, existing = await self._search.dedupe_candidate(fact["content"], emb=emb)
             if action == "skip":
                 continue
             if action == "conflict":
                 answer = await self.llm.chat(
-                    [{"role": "user",
-                      "content": CONFLICT_PROMPT.format(
-                          a=existing["content"], b=fact["content"])}],
-                    max_tokens=64, temperature=0.0)
+                    [
+                        {
+                            "role": "user",
+                            "content": CONFLICT_PROMPT.format(
+                                a=existing["content"], b=fact["content"]
+                            ),
+                        }
+                    ],
+                    max_tokens=64,
+                    temperature=0.0,
+                )
                 words = re.findall(r"\b(same|contradicts|different)\b", answer.lower())
                 verdict = words[-1] if words else None
                 if verdict is None:
                     logger.warning(
-                        "conflict arbitration inconclusive for %s; inserting as new",
-                        existing["id"])
+                        "conflict arbitration inconclusive for %s; inserting as new", existing["id"]
+                    )
                 elif verdict == "same":
                     continue
                 elif verdict == "contradicts":
                     await self._s.supersede_fact(
-                        existing["id"], node_type=existing["type"],
-                        content=fact["content"], confidence=fact["confidence"],
-                        embedding=emb, source_episode_ids=src_ids, entity_ids=eids)
+                        existing["id"],
+                        node_type=existing["type"],
+                        content=fact["content"],
+                        confidence=fact["confidence"],
+                        embedding=emb,
+                        source_episode_ids=src_ids,
+                        entity_ids=eids,
+                    )
                     continue
                 # "different" or inconclusive -> insert as a new fact
                 # "different" -> insert as a new fact
             await self._s.create_fact(
-                content=fact["content"], node_type=fact["type"],
-                confidence=fact["confidence"], embedding=emb,
-                session_id=session_id, event_time=event_time,
-                entity_ids=eids, source_episode_ids=src_ids)
+                content=fact["content"],
+                node_type=fact["type"],
+                confidence=fact["confidence"],
+                embedding=emb,
+                session_id=session_id,
+                event_time=event_time,
+                entity_ids=eids,
+                source_episode_ids=src_ids,
+            )

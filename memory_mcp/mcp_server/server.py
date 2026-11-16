@@ -1,5 +1,6 @@
 # memory_mcp/mcp_server/server.py
 """Memory MCP server (stdio). Graceful shutdown; short model instructions."""
+
 from __future__ import annotations
 
 import asyncio
@@ -43,7 +44,9 @@ SERVER_INSTRUCTIONS = (
     "use constraint=true for strict rules. If a response has "
     "requires_user_clarification=true, ask the user before changing the stored "
     "fact. Replace outdated facts with correct_fact; pin with confirm_fact; "
-    "delete with forget_fact. Never guess from context alone.")
+    "delete with forget_fact. Never guess from context alone."
+)
+
 
 @dataclass
 class AppContext:
@@ -60,7 +63,9 @@ class AppContext:
     tools: MemoryTools
     scheduler: AsyncIOScheduler | None
 
+
 ctx: AppContext | None = None
+
 
 async def build_context() -> AppContext:
     db = Database()
@@ -78,24 +83,46 @@ async def build_context() -> AppContext:
     search = SearchService(storage, embedding, entity_index)
     decay = DecayService(storage)
     consolidator = Consolidator(storage, search, embedding, entity_index)
-    maintenance = MaintenanceService(storage, consolidator, decay, embedding,
-                                     entity_index, search)
+    maintenance = MaintenanceService(storage, consolidator, decay, embedding, entity_index, search)
     tools = MemoryTools(storage, search, embedding, entity_index, decay)
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(maintenance.run_nightly, "cron",
-                      hour=settings.consolidation_cron_hour,
-                      minute=settings.consolidation_cron_minute,
-                      id="nightly-maintenance", max_instances=1, coalesce=True)
-    scheduler.add_job(maintenance.run_consolidation_tick, "interval",
-                      minutes=settings.session_timeout_minutes,
-                      id="consolidation-tick", max_instances=1, coalesce=True)
+    scheduler.add_job(
+        maintenance.run_nightly,
+        "cron",
+        hour=settings.consolidation_cron_hour,
+        minute=settings.consolidation_cron_minute,
+        id="nightly-maintenance",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        maintenance.run_consolidation_tick,
+        "interval",
+        minutes=settings.session_timeout_minutes,
+        id="consolidation-tick",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
 
-    app = AppContext(db, queue, storage, embedding, entity_index, hot_path,
-                     search, decay, consolidator, maintenance, tools, scheduler)
-    await maintenance.run_if_overdue()   # spawns catch-up task via registry
+    app = AppContext(
+        db,
+        queue,
+        storage,
+        embedding,
+        entity_index,
+        hot_path,
+        search,
+        decay,
+        consolidator,
+        maintenance,
+        tools,
+        scheduler,
+    )
+    await maintenance.run_if_overdue()  # spawns catch-up task via registry
     return app
+
 
 async def teardown(app: AppContext | None) -> None:
     if app is None:
@@ -128,8 +155,10 @@ async def teardown(app: AppContext | None) -> None:
         except (asyncio.TimeoutError, Exception):
             pass
 
+
 # Single-flight protection for concurrent signals
 _SHUTTING_DOWN = False
+
 
 async def _graceful_shutdown(sig: int) -> None:
     global ctx, _SHUTTING_DOWN
@@ -152,6 +181,7 @@ async def _graceful_shutdown(sig: int) -> None:
         pass
     os.kill(os.getpid(), sig)
 
+
 @asynccontextmanager
 async def lifespan(server):
     global ctx
@@ -159,8 +189,7 @@ async def lifespan(server):
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(
-                sig, lambda s=sig: asyncio.ensure_future(_graceful_shutdown(s)))
+            loop.add_signal_handler(sig, lambda s=sig: asyncio.ensure_future(_graceful_shutdown(s)))
         except (NotImplementedError, RuntimeError):
             pass
     try:
@@ -169,28 +198,35 @@ async def lifespan(server):
         await teardown(ctx)
         ctx = None
 
+
 def _is_loopback(host: str) -> bool:
     return host in ("127.0.0.1", "::1", "localhost")
+
 
 def _build_auth():
     if not settings.http_token:
         return None
     from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+
     return StaticTokenVerifier(
-        tokens={settings.http_token: {"client_id": "memory-client",
-                                      "scopes": ["memory"]}},
+        tokens={settings.http_token: {"client_id": "memory-client", "scopes": ["memory"]}},
         required_scopes=["memory"],
     )
+
 
 def _validate_http_settings() -> None:
     if not settings.http_token and not _is_loopback(settings.http_host):
         raise RuntimeError(
             "MEMORY_HTTP_TOKEN is required when MEMORY_HTTP_HOST is not loopback "
             f"(got {settings.http_host!r}). Generate one with: "
-            'python -c "import secrets; print(secrets.token_urlsafe(32))"')
+            'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+        )
 
-mcp = FastMCP("memory-server", instructions=SERVER_INSTRUCTIONS,
-              lifespan=lifespan, auth=_build_auth())
+
+mcp = FastMCP(
+    "memory-server", instructions=SERVER_INSTRUCTIONS, lifespan=lifespan, auth=_build_auth()
+)
+
 
 def tool_errors(fn):
     @wraps(fn)
@@ -202,21 +238,29 @@ def tool_errors(fn):
         except Exception:
             logger.exception("%s failed", fn.__name__)
             raise ToolError(f"{fn.__name__} failed") from None
+
     return wrapper
+
 
 @mcp.tool()
 @tool_errors
 async def record_message(
-    message: Annotated[str, Field(max_length=4000,
-        description="The user's exact raw message for this turn")],
+    message: Annotated[
+        str, Field(max_length=4000, description="The user's exact raw message for this turn")
+    ],
     role: Literal["user", "assistant"] = "user",
-    session_id: Annotated[str | None, Field(max_length=64,
-        description="Host chat/conversation id; omit for auto-managed session")] = None,
+    session_id: Annotated[
+        str | None,
+        Field(
+            max_length=64, description="Host chat/conversation id; omit for auto-managed session"
+        ),
+    ] = None,
 ) -> dict:
     """Record a dialogue message as an episode. Call FIRST every turn."""
     sid = ctx.hot_path.current_session(session_id)
     episode_id = await ctx.hot_path.record_message(sid, message, role=role)
     return {"status": "recorded", "episode_id": episode_id}
+
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
@@ -228,6 +272,7 @@ async def get_turn_context(
     <user_memory> block. Call after record_message, before answering."""
     return await ctx.tools.get_turn_context(user_message, limit=limit)
 
+
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def get_active_directives(
@@ -236,59 +281,87 @@ async def get_active_directives(
     """Hard constraints and pinned preferences (absolute priority)."""
     return await ctx.tools.get_active_directives(limit=limit)
 
+
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def search_memory(
     query: Annotated[str, Field(description="Question or keywords, RU or EN")],
     node_types: Annotated[
         list[Literal["episodic", "semantic", "procedural", "opinion"]] | None,
-        Field(description="Filter node types; omit for facts only")] = None,
+        Field(description="Filter node types; omit for facts only"),
+    ] = None,
     limit: Annotated[int, Field(ge=1, le=50)] = 10,
 ) -> list[dict]:
     """Search long-term memory before answering about user, people, projects, past."""
     return await ctx.tools.search_memory(query, node_types=node_types, limit=limit)
 
+
 @mcp.tool()
 @tool_errors
 async def remember_fact(
-    content: Annotated[str, Field(max_length=1000,
-        description="Self-contained sentence, explicit names, no pronouns")],
+    content: Annotated[
+        str,
+        Field(max_length=1000, description="Self-contained sentence, explicit names, no pronouns"),
+    ],
     node_type: Literal["semantic", "procedural", "opinion"] = "semantic",
     confidence: Annotated[float, Field(ge=0, le=1)] = 0.9,
-    entities: Annotated[list[str] | None,
-        Field(description="Entity names; auto-extracted when omitted")] = None,
+    entities: Annotated[
+        list[str] | None, Field(description="Entity names; auto-extracted when omitted")
+    ] = None,
     pin: Annotated[bool, Field(description="Protect from forgetting")] = False,
-    force: Annotated[bool, Field(
-        description="Store even if a similar fact already exists")] = False,
-    constraint: Annotated[bool, Field(
-        description="Hard rule: pinned forever, always in Directives")] = False,
-    session_id: Annotated[str | None, Field(max_length=64,
-        description="Host chat/conversation id; omit for auto-managed session")] = None,
+    force: Annotated[
+        bool, Field(description="Store even if a similar fact already exists")
+    ] = False,
+    constraint: Annotated[
+        bool, Field(description="Hard rule: pinned forever, always in Directives")
+    ] = False,
+    session_id: Annotated[
+        str | None,
+        Field(
+            max_length=64, description="Host chat/conversation id; omit for auto-managed session"
+        ),
+    ] = None,
 ) -> dict:
     """Store a durable fact. May return duplicate/similar instead of creating."""
     sid = ctx.hot_path.current_session(session_id)
     ep = await ctx.storage.last_episode_id(sid)
     return await ctx.tools.remember_fact(
-        content, node_type=node_type, confidence=confidence, entities=entities,
-        pin=pin, force=force, constraint=constraint,
-        source_episode_ids=[ep] if ep else ())
+        content,
+        node_type=node_type,
+        confidence=confidence,
+        entities=entities,
+        pin=pin,
+        force=force,
+        constraint=constraint,
+        source_episode_ids=[ep] if ep else (),
+    )
+
 
 @mcp.tool(annotations={"destructiveHint": True})
 @tool_errors
 async def correct_fact(
     old_node_id: Annotated[str, Field(description="Id of the outdated fact")],
-    new_content: Annotated[str, Field(max_length=1000,
-        description="Replacement sentence, self-contained")],
+    new_content: Annotated[
+        str, Field(max_length=1000, description="Replacement sentence, self-contained")
+    ],
     new_confidence: Annotated[float, Field(ge=0, le=1)] = 0.9,
-    session_id: Annotated[str | None, Field(max_length=64,
-        description="Host chat/conversation id; omit for auto-managed session")] = None,
+    session_id: Annotated[
+        str | None,
+        Field(
+            max_length=64, description="Host chat/conversation id; omit for auto-managed session"
+        ),
+    ] = None,
 ) -> dict:
     """Replace an outdated fact when new info contradicts it."""
     sid = ctx.hot_path.current_session(session_id)
     ep = await ctx.storage.last_episode_id(sid)
     return await ctx.tools.correct_fact(
-        old_node_id, new_content, new_confidence=new_confidence,
-        source_episode_ids=[ep] if ep else ())
+        old_node_id,
+        new_content,
+        new_confidence=new_confidence,
+        source_episode_ids=[ep] if ep else (),
+    )
+
 
 @mcp.tool()
 @tool_errors
@@ -297,6 +370,7 @@ async def confirm_fact(
 ) -> dict:
     """Pin a fact permanently (confidence=1.0, no decay)."""
     return await ctx.tools.confirm_fact(node_id)
+
 
 @mcp.tool(annotations={"destructiveHint": True})
 @tool_errors
@@ -307,6 +381,7 @@ async def forget_fact(
     """Remove a fact (soft by default, hard on request)."""
     return await ctx.tools.forget_fact(node_id, hard=hard)
 
+
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def get_entity_info(
@@ -314,6 +389,7 @@ async def get_entity_info(
 ) -> dict:
     """Entity profile: summary, aliases, linked facts."""
     return await ctx.tools.get_entity_info(entity_name)
+
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
@@ -324,15 +400,17 @@ async def get_timeline(
     limit: Annotated[int, Field(ge=1, le=50)] = 20,
 ) -> list[dict]:
     """Chronological dialogue episodes."""
-    return await ctx.tools.get_timeline(entity_name=entity_name,
-                                        time_from=time_from, time_to=time_to,
-                                        limit=limit)
+    return await ctx.tools.get_timeline(
+        entity_name=entity_name, time_from=time_from, time_to=time_to, limit=limit
+    )
+
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def memory_stats() -> dict:
     """Graph metrics and DB size."""
     return await ctx.tools.memory_stats()
+
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
@@ -342,6 +420,7 @@ async def explain_fact(
     """Provenance: source episodes, supersedes chain, entities."""
     return await ctx.tools.explain_fact(node_id)
 
+
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
 async def weak_facts(
@@ -350,10 +429,12 @@ async def weak_facts(
     """Facts fading below effective confidence 0.3."""
     return await ctx.tools.weak_facts(limit=limit)
 
+
 @mcp.prompt()
 def memory_protocol(language: str = "en") -> str:
     """Reference system prompt for hosts: the per-turn memory protocol."""
     return SYSTEM_PROMPT_RU if language.lower().startswith("ru") else SYSTEM_PROMPT_EN
+
 
 # ---------------------------------------------------------------- resources
 # MCP resources are application-driven: the host decides whether to inject them.
@@ -361,49 +442,61 @@ def memory_protocol(language: str = "en") -> str:
 def _res_kwargs(priority: float) -> dict:
     """text/markdown + spec annotations, if this FastMCP version accepts them."""
     import inspect
+
     kw: dict = {"mime_type": "text/markdown"}
     params = inspect.signature(mcp.resource).parameters
-    if ("annotations" in params
-            or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())):
+    if "annotations" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+    ):
         kw["annotations"] = {"audience": ["assistant"], "priority": priority}
     return kw
+
 
 @mcp.resource("memory://user/profile", **_res_kwargs(1.0))
 async def user_profile_resource() -> str:
     """Stable facts about the user (pinned semantic nodes)."""
     return await ctx.tools.render_profile()
 
+
 @mcp.resource("memory://user/constraints", **_res_kwargs(1.0))
 async def user_constraints_resource() -> str:
     """Hard rules that always apply."""
     return await ctx.tools.render_constraints()
+
 
 @mcp.resource("memory://user/preferences", **_res_kwargs(0.8))
 async def user_preferences_resource() -> str:
     """Pinned soft preferences."""
     return await ctx.tools.render_preferences()
 
+
 @mcp.resource("memory://episodes/recent", **_res_kwargs(0.3))
 async def recent_episodes_resource() -> str:
     """Last dialogue episodes, chronological."""
     return await ctx.tools.render_recent_episodes()
+
 
 @mcp.resource("memory://entities/{entity_id}", **_res_kwargs(0.5))
 async def entity_resource(entity_id: str) -> str:
     """Entity profile: summary, aliases, linked facts."""
     return await ctx.tools.render_entity(entity_id)
 
+
 @mcp.resource("memory://session/{session_id}/summary", **_res_kwargs(0.6))
 async def session_summary_resource(session_id: str) -> str:
     """Extractive digest of one session: recent turns + its facts."""
     return await ctx.tools.render_session_digest(session_id)
 
+
 def main() -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if settings.log_to_file:
         settings.log_file.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(RotatingFileHandler(
-            settings.log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"))
+        handlers.append(
+            RotatingFileHandler(
+                settings.log_file, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+            )
+        )
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -413,14 +506,23 @@ def main() -> None:
         _validate_http_settings()
         if not settings.http_token:
             logger.warning("HTTP without token: loopback-only; do not expose to the network")
-        logger.info("memory-mcp starting (http://%s:%s%s)",
-                    settings.http_host, settings.http_port, settings.http_path)
-        mcp.run(transport="http", host=settings.http_host,
-                port=settings.http_port, path=settings.http_path)
+        logger.info(
+            "memory-mcp starting (http://%s:%s%s)",
+            settings.http_host,
+            settings.http_port,
+            settings.http_path,
+        )
+        mcp.run(
+            transport="http",
+            host=settings.http_host,
+            port=settings.http_port,
+            path=settings.http_path,
+        )
     else:
         logging.getLogger("apscheduler").setLevel(logging.WARNING)
         logger.info("memory-mcp starting (stdio)")
         mcp.run(transport="stdio")
+
 
 if __name__ == "__main__":
     main()

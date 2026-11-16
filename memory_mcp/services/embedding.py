@@ -1,6 +1,7 @@
 # services/embedding.py
 """Async client for an OpenAI-compatible embedding server (e.g. llama-server).
 Vectors are L2-normalized after truncation so that cosine == 1 - d²/2."""
+
 from __future__ import annotations
 
 import logging
@@ -26,16 +27,22 @@ def _normalize(vec: list[float]) -> list[float]:
 
 
 class EmbeddingService:
-    def __init__(self, *, api_url: str | None = None,
-                 api_key: str | None = None, model: str | None = None,
-                 dim: int | None = None):
+    def __init__(
+        self,
+        *,
+        api_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        dim: int | None = None,
+    ):
         self._url = (api_url or settings.embedding_api_url).rstrip("/") + "/v1/embeddings"
         self._key = api_key or settings.embedding_api_key
         self._model = model or settings.embedding_model
         self._dim = dim or settings.embedding_dim
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.embedding_timeout,
-                                  connect=settings.embedding_connect_timeout),
+            timeout=httpx.Timeout(
+                settings.embedding_timeout, connect=settings.embedding_connect_timeout
+            ),
             headers=({"Authorization": f"Bearer {self._key}"} if self._key else {}),
         )
 
@@ -53,14 +60,12 @@ class EmbeddingService:
             return []
         out: list[list[float]] = []
         for i in range(0, len(texts), BATCH_SIZE):
-            batch = texts[i:i + BATCH_SIZE]
-            out.extend(await self._call_batch(batch,
-                                              prefix=settings.embedding_document_prefix))
+            batch = texts[i : i + BATCH_SIZE]
+            out.extend(await self._call_batch(batch, prefix=settings.embedding_document_prefix))
         return out
 
     async def _call_batch(self, texts: list[str], *, prefix: str) -> list[list[float]]:
-        payload = {"model": self._model,
-                   "input": [prefix + t for t in texts]}
+        payload = {"model": self._model, "input": [prefix + t for t in texts]}
         try:
             resp = await self._client.post(self._url, json=payload)
             resp.raise_for_status()
@@ -69,8 +74,7 @@ class EmbeddingService:
             raise EmbeddingError(f"embedding request failed: {e}") from e
 
         try:
-            raw = [item["embedding"] for item in
-                   sorted(data["data"], key=lambda d: d["index"])]
+            raw = [item["embedding"] for item in sorted(data["data"], key=lambda d: d["index"])]
         except (KeyError, IndexError, TypeError) as e:
             raise EmbeddingError(f"malformed embedding response: {e}") from e
 
@@ -84,8 +88,7 @@ class EmbeddingService:
             if settings.embedding_truncate_matryoshka and len(vec) > self._dim:
                 vec = vec[: self._dim]
             if len(vec) != self._dim:
-                raise EmbeddingError(
-                    f"embedding dim {len(vec)} != expected {self._dim}")
+                raise EmbeddingError(f"embedding dim {len(vec)} != expected {self._dim}")
             out.append(_normalize([float(x) for x in vec]))
         return out
 

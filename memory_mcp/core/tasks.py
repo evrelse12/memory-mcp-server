@@ -1,5 +1,6 @@
 # core/tasks.py
 """Registry for fire-and-forget tasks so they are never garbage-collected."""
+
 from __future__ import annotations
 
 import asyncio

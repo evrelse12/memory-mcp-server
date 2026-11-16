@@ -1,5 +1,6 @@
 # tests/test_fixes.py
 """Regression tests for the bug-fix batch (offline, deterministic)."""
+
 import asyncio
 import json
 
@@ -16,9 +17,17 @@ class FakeLLM:
         return "contradicts"
 
     async def chat_json(self, messages, **kw):
-        return {"facts": [{"content": "The user lives in Moscow",
-                           "type": "semantic", "confidence": 0.9, "sources": [0],
-                           "entities": [{"name": "Moscow", "type": "place"}]}]}
+        return {
+            "facts": [
+                {
+                    "content": "The user lives in Moscow",
+                    "type": "semantic",
+                    "confidence": 0.9,
+                    "sources": [0],
+                    "entities": [{"name": "Moscow", "type": "place"}],
+                }
+            ]
+        }
 
     async def close(self):
         pass
@@ -37,6 +46,7 @@ def _vec_for(text):
 def patched(monkeypatch):
     import memory_mcp.agents.consolidator as cons_mod
     from memory_mcp.services import embedding as emb_mod
+
     monkeypatch.setattr(cons_mod, "LLMClient", lambda: FakeLLM())
 
     async def _call(self, text, *, prefix=""):
@@ -60,7 +70,7 @@ def test_fts_query_builder():
 async def test_russian_fts_offline(fresh_db):
     async with server.lifespan(server.mcp):
         ctx = server.ctx
-        await drain(timeout=2)   # let startup catch-up finish before the test acts
+        await drain(timeout=2)  # let startup catch-up finish before the test acts
         await ctx.tools.remember_fact("Пользователь работал в Яндексе")
         r = await ctx.tools.search_memory("работу", limit=5)
         assert any("Яндексе" in x["content"] for x in r)
@@ -71,9 +81,9 @@ async def test_merge_alias_atomic(fresh_db):
     async with server.lifespan(server.mcp):
         s = server.ctx.storage
         eid = await s.upsert_entity(name_norm="google", canonical="Google")
-        await asyncio.gather(s.merge_alias(eid, "Гугл"),
-                             s.merge_alias(eid, "Alphabet"),
-                             s.merge_alias(eid, "Гугл"))
+        await asyncio.gather(
+            s.merge_alias(eid, "Гугл"), s.merge_alias(eid, "Alphabet"), s.merge_alias(eid, "Гугл")
+        )
         ent = await s.get_entity(eid)
         aliases = json.loads(ent["aliases"])
         assert len(aliases) == 2
@@ -97,8 +107,11 @@ async def test_assistant_episodes_excluded(fresh_db, patched):
         ctx = server.ctx
         await drain(timeout=2)
         await ctx.hot_path.record_message("sA", "I live in Moscow", role="assistant")
-        eps = [n for n in await ctx.storage.fetch_nodes_by_session("sA", None)
-               if n["type"] == "episodic"]
+        eps = [
+            n
+            for n in await ctx.storage.fetch_nodes_by_session("sA", None)
+            if n["type"] == "episodic"
+        ]
         assert await ctx.consolidator.consolidate_session("sA", episodes=eps) is True
         assert await ctx.tools.search_memory("Moscow") == []
 
@@ -107,7 +120,7 @@ async def test_assistant_episodes_excluded(fresh_db, patched):
 async def test_retro_dedup_sweep(fresh_db, patched):
     async with server.lifespan(server.mcp):
         ctx = server.ctx
-        await drain(timeout=2)   # startup catch-up must not race the sweep
+        await drain(timeout=2)  # startup catch-up must not race the sweep
         a = await ctx.tools.remember_fact("The user lives in Moscow")
         b = await ctx.tools.remember_fact("The user lives in Moscow", force=True)
         rep = await ctx.search.sweep_duplicates()
@@ -121,7 +134,7 @@ async def test_entity_vector_alias(fresh_db, patched):
     async with server.lifespan(server.mcp):
         ctx = server.ctx
         eid1 = await ctx.entity_index.ensure("Google", "organization")
-        await drain(timeout=2)   # background entity embedding must land in vec_entities
+        await drain(timeout=2)  # background entity embedding must land in vec_entities
         eid2 = await ctx.entity_index.ensure("Гугл")
         assert eid2 == eid1
         ent = await ctx.storage.get_entity(eid1)
@@ -138,16 +151,24 @@ async def test_supersede_preserves_type(fresh_db, patched):
         old_id = old["node_id"]
 
         async def fake_dedupe(content, **kw):
-            return "conflict", {"id": old_id, "content": "The user dislikes Java",
-                                "type": "opinion", "decay_rate": 0.1}
+            return "conflict", {
+                "id": old_id,
+                "content": "The user dislikes Java",
+                "type": "opinion",
+                "decay_rate": 0.1,
+            }
+
         ctx.consolidator._search.dedupe_candidate = fake_dedupe
 
         await ctx.hot_path.record_message("sT", "Actually I love Java now")
-        eps = [n for n in await ctx.storage.fetch_nodes_by_session("sT", None)
-               if n["type"] == "episodic"]
+        eps = [
+            n
+            for n in await ctx.storage.fetch_nodes_by_session("sT", None)
+            if n["type"] == "episodic"
+        ]
         assert await ctx.consolidator.consolidate_session("sT", episodes=eps)
         edges = await ctx.storage.fetch_edges_for_nodes([old_id])
         sup = [e for e in edges if e["relation_type"] == "supersedes"]
         assert sup
         new = await ctx.storage.get_node(sup[0]["source_id"])
-        assert new["type"] == "opinion"   # was: semantic (the bug)
+        assert new["type"] == "opinion"  # was: semantic (the bug)

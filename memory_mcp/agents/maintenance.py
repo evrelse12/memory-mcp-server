@@ -1,5 +1,6 @@
 # agents/maintenance.py
 """Nightly maintenance: consolidation, dedup, decay, enrichment, housekeeping."""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,9 +20,17 @@ logger = logging.getLogger(__name__)
 
 OVERDUE_S = 20 * 3600
 
+
 class MaintenanceService:
-    def __init__(self, storage: Storage, consolidator, decay: DecayService,
-                 embedding: EmbeddingService, entity_index: EntityIndex, search):
+    def __init__(
+        self,
+        storage: Storage,
+        consolidator,
+        decay: DecayService,
+        embedding: EmbeddingService,
+        entity_index: EntityIndex,
+        search,
+    ):
         self._s = storage
         self._c = consolidator
         self._decay = decay
@@ -88,8 +97,11 @@ class MaintenanceService:
         consolidated = 0
         for sid in sids:
             since = await self._s.session_consolidated_at(sid)
-            eps = [n for n in await self._s.fetch_nodes_by_session(sid, since)
-                   if n["type"] == "episodic"]
+            eps = [
+                n
+                for n in await self._s.fetch_nodes_by_session(sid, since)
+                if n["type"] == "episodic"
+            ]
             if not eps:
                 continue
             if await self._c.consolidate_session(sid, episodes=eps):
@@ -117,12 +129,13 @@ class MaintenanceService:
             if not nodes:
                 continue
             ctx = "\n".join(f"- {n['content'][:200]}" for n in nodes[:10])
-            prompt = (f"Summarize in 2-3 sentences what is known about "
-                      f"{e['canonical_name']}:\n{ctx}")
+            prompt = f"Summarize in 2-3 sentences what is known about {e['canonical_name']}:\n{ctx}"
             try:
-                summary = (await self._c.llm.chat(
-                    [{"role": "user", "content": prompt}],
-                    max_tokens=200, temperature=0.3)).strip()[:600]
+                summary = (
+                    await self._c.llm.chat(
+                        [{"role": "user", "content": prompt}], max_tokens=200, temperature=0.3
+                    )
+                ).strip()[:600]
             except LLMError:
                 continue
             if not summary:
@@ -130,7 +143,8 @@ class MaintenanceService:
             attrs["summary_mentions"] = e["mention_count"]
             await self._s.execute(
                 "UPDATE entities SET summary=?, attributes=?, last_updated=? WHERE id=?",
-                (summary, json.dumps(attrs, ensure_ascii=False), now, e["id"]))
+                (summary, json.dumps(attrs, ensure_ascii=False), now, e["id"]),
+            )
             try:
                 await self._ei.embed_entity(e["id"], f"{e['canonical_name']}. {summary}")
             except EmbeddingError:

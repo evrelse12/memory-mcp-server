@@ -1,5 +1,6 @@
 # tests/test_bench.py
 """Offline unit tests for the benchmark harness (no services, no dataset)."""
+
 import pytest
 
 from bench import datasets, harness
@@ -20,16 +21,27 @@ def test_detect_format():
 
 
 def test_load_longmemeval():
-    raw = [{"question_id": "q1", "question_type": "knowledge-update",
-            "question": "Where does the user work?", "answer": "Google",
+    raw = [
+        {
+            "question_id": "q1",
+            "question_type": "knowledge-update",
+            "question": "Where does the user work?",
+            "answer": "Google",
             "question_date": "2023/05/20 (Sat) 12:00",
             "haystack_dates": ["2023/05/01 (Mon) 10:00"],
             "haystack_session_ids": ["sess-1"],
             "haystack_sessions": [[{"role": "user", "content": "I joined Google"}]],
-            "answer_session_ids": ["sess-1"]},
-           {"question_id": "q2_abs", "question_type": "multi-session",
-            "question": "Cat name?", "answer": "unknown",
-            "haystack_sessions": [[]], "answer_session_ids": []}]
+            "answer_session_ids": ["sess-1"],
+        },
+        {
+            "question_id": "q2_abs",
+            "question_type": "multi-session",
+            "question": "Cat name?",
+            "answer": "unknown",
+            "haystack_sessions": [[]],
+            "answer_session_ids": [],
+        },
+    ]
     items = datasets.load_longmemeval(raw)
     q = items[0].questions[0]
     assert q.kind == "knowledge-updates" and q.evidence == ["sess-1"]
@@ -39,12 +51,19 @@ def test_load_longmemeval():
 
 
 def test_load_locomo():
-    raw = [{"sample_id": "conv-1",
-            "conversation": {"session_1": [{"speaker": "Alice", "text": "hi"}],
-                             "session_1_date_time": "1:32 pm on 8 May, 2023"},
-            "qa": [{"question": "Who said hi?", "answer": "Alice", "category": 4},
-                   {"question": "Unanswerable?", "adversarial_answer": "no info",
-                    "category": 5}]}]
+    raw = [
+        {
+            "sample_id": "conv-1",
+            "conversation": {
+                "session_1": [{"speaker": "Alice", "text": "hi"}],
+                "session_1_date_time": "1:32 pm on 8 May, 2023",
+            },
+            "qa": [
+                {"question": "Who said hi?", "answer": "Alice", "category": 4},
+                {"question": "Unanswerable?", "adversarial_answer": "no info", "category": 5},
+            ],
+        }
+    ]
     items = datasets.load_locomo(raw)
     assert items[0].sessions[0].sid == "session_1"
     assert items[0].sessions[0].turns[0].role == "user"
@@ -61,9 +80,11 @@ def test_yesno():
 
 def test_aggregate():
     r = harness.Result
-    rs = [r("i", "a", "k", False, "memory", True, True, 3, 10.0, 5.0),
-          r("i", "b", "k", False, "memory", False, False, 3, 20.0, 5.0),
-          r("i", "c", "k", False, "memory", None, None, 0, 30.0, 5.0)]
+    rs = [
+        r("i", "a", "k", False, "memory", True, True, 3, 10.0, 5.0),
+        r("i", "b", "k", False, "memory", False, False, 3, 20.0, 5.0),
+        r("i", "c", "k", False, "memory", None, None, 0, 30.0, 5.0),
+    ]
     rep = harness.aggregate(rs)["memory"]
     assert rep["n"] == 3 and rep["judged"] == 2 and rep["judge_errors"] == 1
     assert rep["accuracy"] == 0.5

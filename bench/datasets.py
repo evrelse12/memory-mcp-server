@@ -4,6 +4,7 @@
 Field names vary between dataset revisions. Use `--inspect` to print the real
 structure and adjust the mapping instead of trusting a silent guess.
 """
+
 from __future__ import annotations
 
 import json
@@ -13,8 +14,14 @@ from datetime import datetime
 from pathlib import Path
 
 DATE_FORMATS = (
-    "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M", "%Y/%m/%d", "%Y-%m-%d",
-    "%I:%M %p on %d %B, %Y", "%H:%M %d %B %Y", "%d %B %Y", "%B %d, %Y",
+    "%Y/%m/%d %H:%M",
+    "%Y-%m-%d %H:%M",
+    "%Y/%m/%d",
+    "%Y-%m-%d",
+    "%I:%M %p on %d %B, %Y",
+    "%H:%M %d %B %Y",
+    "%d %B %Y",
+    "%B %d, %Y",
 )
 
 LM_ABILITY = {
@@ -28,8 +35,11 @@ LM_ABILITY = {
 
 # Best-effort labels; verify against the dataset docs via --inspect.
 LOCOMO_CATEGORY = {
-    1: "multi-hop", 2: "temporal", 3: "open-domain",
-    4: "single-hop", 5: "adversarial",
+    1: "multi-hop",
+    2: "temporal",
+    3: "open-domain",
+    4: "single-hop",
+    5: "adversarial",
 }
 
 
@@ -60,6 +70,7 @@ class Question:
 @dataclass
 class Item:
     """One haystack + the questions asked over it."""
+
     iid: str
     sessions: list[Session]
     questions: list[Question]
@@ -110,12 +121,23 @@ def load_longmemeval(raw) -> list[Item]:
         qtype = str(r.get("question_type") or "unknown")
         qid = str(r.get("question_id") or f"q{i}")
         abst = "abs" in qid.lower() or "abstention" in qtype.lower()
-        items.append(Item(iid=qid, sessions=sessions, questions=[Question(
-            qid=qid, question=str(r.get("question") or ""),
-            answer=str(r.get("answer") or ""),
-            kind="abstention" if abst else LM_ABILITY.get(qtype, qtype),
-            abstention=abst, ts=parse_ts(r.get("question_date")),
-            evidence=[str(x) for x in (r.get("answer_session_ids") or [])])]))
+        items.append(
+            Item(
+                iid=qid,
+                sessions=sessions,
+                questions=[
+                    Question(
+                        qid=qid,
+                        question=str(r.get("question") or ""),
+                        answer=str(r.get("answer") or ""),
+                        kind="abstention" if abst else LM_ABILITY.get(qtype, qtype),
+                        abstention=abst,
+                        ts=parse_ts(r.get("question_date")),
+                        evidence=[str(x) for x in (r.get("answer_session_ids") or [])],
+                    )
+                ],
+            )
+        )
     return items
 
 
@@ -123,23 +145,37 @@ def load_locomo(raw) -> list[Item]:
     items = []
     for i, r in enumerate(raw):
         conv = r.get("conversation") or {}
-        keys = sorted((k for k in conv if re.fullmatch(r"session_\d+", k)),
-                      key=lambda k: int(k.split("_")[1]))
-        sessions = [Session(sid=k, ts=parse_ts(conv.get(f"{k}_date_time")) or 0,
-                            turns=_turns(conv[k], human=True)) for k in keys]
+        keys = sorted(
+            (k for k in conv if re.fullmatch(r"session_\d+", k)), key=lambda k: int(k.split("_")[1])
+        )
+        sessions = [
+            Session(
+                sid=k,
+                ts=parse_ts(conv.get(f"{k}_date_time")) or 0,
+                turns=_turns(conv[k], human=True),
+            )
+            for k in keys
+        ]
         questions = []
         for j, qa in enumerate(r.get("qa") or []):
             kind = LOCOMO_CATEGORY.get(qa.get("category"), str(qa.get("category")))
             ans = qa.get("answer")
             if ans is None:
                 ans = qa.get("adversarial_answer", "")
-            questions.append(Question(
-                qid=f"{r.get('sample_id', i)}-{j}",
-                question=str(qa.get("question") or ""), answer=str(ans or ""),
-                kind=kind, abstention=(kind == "adversarial"), ts=None,
-                evidence=[str(x) for x in (qa.get("evidence") or [])]))
-        items.append(Item(iid=str(r.get("sample_id") or f"conv{i}"),
-                          sessions=sessions, questions=questions))
+            questions.append(
+                Question(
+                    qid=f"{r.get('sample_id', i)}-{j}",
+                    question=str(qa.get("question") or ""),
+                    answer=str(ans or ""),
+                    kind=kind,
+                    abstention=(kind == "adversarial"),
+                    ts=None,
+                    evidence=[str(x) for x in (qa.get("evidence") or [])],
+                )
+            )
+        items.append(
+            Item(iid=str(r.get("sample_id") or f"conv{i}"), sessions=sessions, questions=questions)
+        )
     return items
 
 
@@ -167,30 +203,43 @@ def load(path: str, fmt: str = "auto") -> list[Item]:
 def inspect(path: str) -> str:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     first = raw[0] if isinstance(raw, list) and raw else raw
-    lines = [f"records: {len(raw) if isinstance(raw, list) else 1}",
-             f"top-level keys: {sorted(first) if isinstance(first, dict) else type(first)}"]
+    lines = [
+        f"records: {len(raw) if isinstance(raw, list) else 1}",
+        f"top-level keys: {sorted(first) if isinstance(first, dict) else type(first)}",
+    ]
     try:
         lines.append(f"detected format: {detect_format(raw)}")
     except ValueError as e:
         lines.append(f"detect failed: {e}")
     if isinstance(first, dict):
-        for key in ("question_type", "question_id", "question_date",
-                    "haystack_dates", "haystack_session_ids", "answer_session_ids"):
+        for key in (
+            "question_type",
+            "question_id",
+            "question_date",
+            "haystack_dates",
+            "haystack_session_ids",
+            "answer_session_ids",
+        ):
             if key in first:
                 lines.append(f"{key}: {json.dumps(first[key], ensure_ascii=False)[:200]}")
         if "haystack_sessions" in first and first["haystack_sessions"]:
-            lines.append("turn sample: " + json.dumps(
-                first["haystack_sessions"][0][:1], ensure_ascii=False)[:300])
+            lines.append(
+                "turn sample: "
+                + json.dumps(first["haystack_sessions"][0][:1], ensure_ascii=False)[:300]
+            )
         if "conversation" in first:
             ck = sorted(first["conversation"])[:6]
             lines.append(f"conversation keys (sample): {ck}")
             for k in ck:
                 if re.fullmatch(r"session_\d+", k) and first["conversation"][k]:
-                    lines.append("turn sample: " + json.dumps(
-                        first["conversation"][k][:1], ensure_ascii=False)[:300])
+                    lines.append(
+                        "turn sample: "
+                        + json.dumps(first["conversation"][k][:1], ensure_ascii=False)[:300]
+                    )
                     break
         if "qa" in first and first["qa"]:
             lines.append("qa sample: " + json.dumps(first["qa"][0], ensure_ascii=False)[:300])
-            lines.append("qa categories: " + str(sorted(
-                {q.get("category") for q in first["qa"]}, key=str)))
+            lines.append(
+                "qa categories: " + str(sorted({q.get("category") for q in first["qa"]}, key=str))
+            )
     return "\n".join(lines)

@@ -1,5 +1,6 @@
 # services/hot_path.py
 """Hot path: record episodes, link entities, defer embeddings to background."""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,9 +16,9 @@ from memory_mcp.services.entity_index import EntityIndex
 
 logger = logging.getLogger(__name__)
 
+
 class HotPath:
-    def __init__(self, storage: Storage, embedding: EmbeddingService,
-                 entity_index: EntityIndex):
+    def __init__(self, storage: Storage, embedding: EmbeddingService, entity_index: EntityIndex):
         self._s = storage
         self._emb = embedding
         self._ei = entity_index
@@ -34,8 +35,7 @@ class HotPath:
         if explicit:
             return explicit
         now = int(time.time())
-        if (self._auto_sid is None
-                or now - self._auto_last > settings.session_timeout_minutes * 60):
+        if self._auto_sid is None or now - self._auto_last > settings.session_timeout_minutes * 60:
             self._auto_sid = uuid.uuid4().hex[:12]
         self._auto_last = now
         return self._auto_sid
@@ -44,16 +44,22 @@ class HotPath:
         # per-session lock: two parallel messages must not fork the temporal chain
         return self._session_locks.setdefault(session_id, asyncio.Lock())
 
-    async def record_message(self, session_id: str, message: str, *,
-                             role: str = "user") -> str:
+    async def record_message(self, session_id: str, message: str, *, role: str = "user") -> str:
         text = message[: settings.max_episode_chars]
         async with self._lock(session_id):
             now = int(time.time())
-            stmt, nid = self._s.node_stmt({
-                "type": "episodic", "content": text, "session_id": session_id,
-                "event_time": now, "confidence": 1.0, "decay_rate": 0.0,
-                "needs_embedding": True, "metadata": {"role": role},
-            })
+            stmt, nid = self._s.node_stmt(
+                {
+                    "type": "episodic",
+                    "content": text,
+                    "session_id": session_id,
+                    "event_time": now,
+                    "confidence": 1.0,
+                    "decay_rate": 0.0,
+                    "needs_embedding": True,
+                    "metadata": {"role": role},
+                }
+            )
             stmts = [stmt]
             # NOTE: temporal edges are not written; ordering is recovered
             # from (session_id, event_time, rid).

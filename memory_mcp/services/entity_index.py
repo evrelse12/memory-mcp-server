@@ -1,5 +1,6 @@
 # memory_mcp/services/entity_index.py
 """In-memory entity index: one combined word-boundary regex, canonical names."""
+
 from __future__ import annotations
 
 import json
@@ -19,14 +20,16 @@ logger = logging.getLogger(__name__)
 ENTITY_TYPES = {"person", "project", "organization", "place", "concept", "tool"}
 MIN_NAME_LEN = 3
 
+
 def normalize_name(name: str) -> str:
     return unicodedata.normalize("NFKC", name).casefold().strip()
+
 
 class EntityIndex:
     def __init__(self, storage: Storage, embedding: EmbeddingService):
         self._s = storage
         self._emb = embedding
-        self._by_norm: dict[str, tuple[str, str]] = {}   # norm -> (id, canonical)
+        self._by_norm: dict[str, tuple[str, str]] = {}  # norm -> (id, canonical)
         self._surfaces: list[str] = []
         self._surface_keys: set[str] = set()
         self._combined: re.Pattern | None = None
@@ -37,7 +40,8 @@ class EntityIndex:
         self._surface_keys.clear()
         self._combined = None
         async with self._s.db.get_read_connection().execute(
-                "SELECT id, name_norm, canonical_name, aliases FROM entities") as cur:
+            "SELECT id, name_norm, canonical_name, aliases FROM entities"
+        ) as cur:
             rows = await cur.fetchall()
         for r in rows:
             self._by_norm[r["name_norm"]] = (r["id"], r["canonical_name"])
@@ -55,13 +59,12 @@ class EntityIndex:
             return
         self._surface_keys.add(key)
         self._surfaces.append(surface)
-        self._combined = None   # invalidate; rebuilt lazily on next find
+        self._combined = None  # invalidate; rebuilt lazily on next find
 
     def _pattern(self) -> re.Pattern | None:
         if self._combined is None and self._surfaces:
             # longest-first so "New York" wins over "York" at the same position
-            alts = "|".join(re.escape(s) for s in
-                            sorted(self._surfaces, key=len, reverse=True))
+            alts = "|".join(re.escape(s) for s in sorted(self._surfaces, key=len, reverse=True))
             self._combined = re.compile(r"(?<!\w)(?:" + alts + r")(?!\w)", re.IGNORECASE)
         return self._combined
 
@@ -92,9 +95,9 @@ class EntityIndex:
         except EmbeddingError:
             return None
         async with self._s.db.get_read_connection().execute(
-                "SELECT entity_id, distance FROM vec_entities "
-                "WHERE embedding MATCH ? AND k = ?",
-                (sqlite_vec.serialize_float32(emb), settings.entity_knn_k)) as cur:
+            "SELECT entity_id, distance FROM vec_entities WHERE embedding MATCH ? AND k = ?",
+            (sqlite_vec.serialize_float32(emb), settings.entity_knn_k),
+        ) as cur:
             rows = await cur.fetchall()
         for r in rows:
             if 1.0 - r["distance"] ** 2 / 2.0 >= settings.entity_match_threshold:
@@ -118,8 +121,9 @@ class EntityIndex:
                     existing = (eid, ent["canonical_name"])
                     self._by_norm[norm] = existing
         canonical = existing[1] if existing else name
-        eid = await self._s.upsert_entity(name_norm=normalize_name(canonical),
-                                          canonical=canonical, etype=etype)
+        eid = await self._s.upsert_entity(
+            name_norm=normalize_name(canonical), canonical=canonical, etype=etype
+        )
         if existing is None:
             self._by_norm[norm] = (eid, canonical)
             self._add_pattern(canonical)

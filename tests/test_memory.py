@@ -1,5 +1,6 @@
 # tests/test_memory.py
 """End-to-end MCP tool tests. Each test uses a fresh database directory."""
+
 import json
 
 import pytest
@@ -17,17 +18,24 @@ def _data(res):
 async def test_remember_search_correct_forget(fresh_db):
     async with server.lifespan(server.mcp):
         async with Client(server.mcp) as c:
-            r = _data(await c.call_tool("remember_fact", {
-                "content": "The user works at Yandex", "node_type": "semantic"}))
+            r = _data(
+                await c.call_tool(
+                    "remember_fact",
+                    {"content": "The user works at Yandex", "node_type": "semantic"},
+                )
+            )
             assert r["status"] == "created"
             old_id = r["node_id"]
 
             r = _data(await c.call_tool("search_memory", {"query": "Yandex"}))
             assert any("Yandex" in x["content"] for x in r)
 
-            r = _data(await c.call_tool("correct_fact", {
-                "old_node_id": old_id,
-                "new_content": "The user works at Google"}))
+            r = _data(
+                await c.call_tool(
+                    "correct_fact",
+                    {"old_node_id": old_id, "new_content": "The user works at Google"},
+                )
+            )
             assert r["status"] == "corrected"
 
             r = _data(await c.call_tool("search_memory", {"query": "Google"}))
@@ -39,8 +47,7 @@ async def test_remember_search_correct_forget(fresh_db):
             r = _data(await c.call_tool("search_memory", {"query": "Google"}))
             assert r in ([], None)
 
-            res = await c.call_tool("confirm_fact", {"node_id": "missing"},
-                                    raise_on_error=False)
+            res = await c.call_tool("confirm_fact", {"node_id": "missing"}, raise_on_error=False)
             assert res.is_error
 
 
@@ -60,16 +67,24 @@ async def test_stats_keys(fresh_db):
     async with server.lifespan(server.mcp):
         async with Client(server.mcp) as c:
             r = _data(await c.call_tool("memory_stats", {}))
-    assert {"nodes_by_type", "edges_by_type", "entities_by_type",
-            "orphans", "db_size_mb", "vec_available"} <= set(r)
+    assert {
+        "nodes_by_type",
+        "edges_by_type",
+        "entities_by_type",
+        "orphans",
+        "db_size_mb",
+        "vec_available",
+    } <= set(r)
 
 
 def test_decay_uses_last_access():
     """A recently used old fact must NOT look expired (Ebbinghaus reset)."""
     from memory_mcp.services.decay import DecayService
+
     eff = DecayService.effective_confidence
     assert eff(0.9, 0.1, 70 * 86400) < 0.05
     assert eff(0.9, 0.1, 1 * 86400) > 0.5
+
 
 @pytest.mark.asyncio
 async def test_record_message_and_timeline_last_n(fresh_db):
@@ -80,5 +95,4 @@ async def test_record_message_and_timeline_last_n(fresh_db):
         async with Client(server.mcp) as c:
             r = _data(await c.call_tool("get_timeline", {"limit": 5}))
     contents = [x["content"] for x in r]
-    assert contents == ["message #20", "message #21", "message #22",
-                        "message #23", "message #24"]
+    assert contents == ["message #20", "message #21", "message #22", "message #23", "message #24"]

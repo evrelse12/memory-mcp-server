@@ -1,5 +1,6 @@
 # core/storage.py
 """Typed CRUD over nodes/edges/entities; every write goes through WriteQueue."""
+
 from __future__ import annotations
 
 import json
@@ -17,22 +18,56 @@ from memory_mcp.core.write_queue import WriteQueue
 
 logger = logging.getLogger(__name__)
 
-NODE_COLS = ("id", "type", "content", "session_id", "event_time", "created_at",
-             "last_accessed", "access_count", "confidence", "decay_rate",
-             "needs_embedding", "valid_until", "metadata")
-NODE_UPDATE_ALLOW = {"content", "confidence", "decay_rate", "valid_until",
-                     "metadata", "session_id"}
-EDGE_COLS = ("id", "source_id", "target_id", "relation_type", "predicate",
-             "weight", "confidence", "valid_from", "valid_until", "evidence",
-             "created_at")
-ENTITY_COLS = ("id", "name_norm", "canonical_name", "type", "aliases", "summary",
-               "first_seen", "last_updated", "mention_count", "attributes")
+NODE_COLS = (
+    "id",
+    "type",
+    "content",
+    "session_id",
+    "event_time",
+    "created_at",
+    "last_accessed",
+    "access_count",
+    "confidence",
+    "decay_rate",
+    "needs_embedding",
+    "valid_until",
+    "metadata",
+)
+NODE_UPDATE_ALLOW = {"content", "confidence", "decay_rate", "valid_until", "metadata", "session_id"}
+EDGE_COLS = (
+    "id",
+    "source_id",
+    "target_id",
+    "relation_type",
+    "predicate",
+    "weight",
+    "confidence",
+    "valid_from",
+    "valid_until",
+    "evidence",
+    "created_at",
+)
+ENTITY_COLS = (
+    "id",
+    "name_norm",
+    "canonical_name",
+    "type",
+    "aliases",
+    "summary",
+    "first_seen",
+    "last_updated",
+    "mention_count",
+    "attributes",
+)
+
 
 def _now() -> int:
     return int(time.time())
 
+
 def _ph(ids: Sequence[Any]) -> str:
     return ",".join("?" for _ in ids)
+
 
 class Storage:
     def __init__(self, db: Database, queue: WriteQueue):
@@ -45,12 +80,14 @@ class Storage:
         return self._db
 
     # ------------------------------------------------------------ passthrough
-    async def execute(self, sql: str, params: Any = (), *, wait: bool = True,
-                      many: bool = False) -> int | None:
+    async def execute(
+        self, sql: str, params: Any = (), *, wait: bool = True, many: bool = False
+    ) -> int | None:
         return await self._q.execute(sql, params, wait=wait, many=many)
 
-    async def transaction(self, stmts: Sequence[tuple[str, Any]], *,
-                          wait: bool = True, many: bool = False) -> int | None:
+    async def transaction(
+        self, stmts: Sequence[tuple[str, Any]], *, wait: bool = True, many: bool = False
+    ) -> int | None:
         return await self._q.transaction(stmts, wait=wait, many=many)
 
     async def raw(self, sql: str, params: Any = (), *, wait: bool = True) -> int | None:
@@ -95,33 +132,49 @@ class Storage:
             "metadata": json.dumps(data.get("metadata") or {}, ensure_ascii=False),
         }
         cols, ph = ", ".join(NODE_COLS), _ph(NODE_COLS)
-        return (f"INSERT INTO nodes ({cols}) VALUES ({ph})",
-                tuple(row[c] for c in NODE_COLS)), row["id"]
+        return (f"INSERT INTO nodes ({cols}) VALUES ({ph})", tuple(row[c] for c in NODE_COLS)), row[
+            "id"
+        ]
 
-    def edge_stmt(self, source_id: str, target_id: str, relation_type: str, *,
-                  confidence: float = 1.0, weight: float = 1.0,
-                  predicate: str | None = None,
-                  evidence: list | None = None,
-                  now: int | None = None) -> tuple[str, tuple]:
+    def edge_stmt(
+        self,
+        source_id: str,
+        target_id: str,
+        relation_type: str,
+        *,
+        confidence: float = 1.0,
+        weight: float = 1.0,
+        predicate: str | None = None,
+        evidence: list | None = None,
+        now: int | None = None,
+    ) -> tuple[str, tuple]:
         now = now or _now()
         row = {
             "id": uuid.uuid4().hex,
-            "source_id": source_id, "target_id": target_id,
-            "relation_type": relation_type, "predicate": predicate,
-            "weight": weight, "confidence": confidence,
-            "valid_from": now, "valid_until": None,
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation_type": relation_type,
+            "predicate": predicate,
+            "weight": weight,
+            "confidence": confidence,
+            "valid_from": now,
+            "valid_until": None,
             "evidence": json.dumps(evidence or [], ensure_ascii=False),
             "created_at": now,
         }
         cols, ph = ", ".join(EDGE_COLS), _ph(EDGE_COLS)
-        return (f"INSERT INTO edges ({cols}) VALUES ({ph}) ON CONFLICT DO NOTHING",
-                tuple(row[c] for c in EDGE_COLS))
+        return (
+            f"INSERT INTO edges ({cols}) VALUES ({ph}) ON CONFLICT DO NOTHING",
+            tuple(row[c] for c in EDGE_COLS),
+        )
 
     @staticmethod
     def _vec_stmt(node_id: str, embedding: Sequence[float]) -> tuple[str, tuple]:
         # vec0 does not support ON CONFLICT DO UPDATE; use INSERT OR REPLACE
-        return ("""INSERT OR REPLACE INTO vec_nodes(node_id, embedding) VALUES (?,?)""",
-                (node_id, sqlite_vec.serialize_float32([float(x) for x in embedding])))
+        return (
+            """INSERT OR REPLACE INTO vec_nodes(node_id, embedding) VALUES (?,?)""",
+            (node_id, sqlite_vec.serialize_float32([float(x) for x in embedding])),
+        )
 
     # ------------------------------------------------------------ nodes
     async def insert_node(self, data: dict, *, wait: bool = True) -> str:
@@ -129,13 +182,11 @@ class Storage:
         await self._q.execute(stmt[0], stmt[1], wait=wait)
         return nid
 
-    async def get_node(self, node_id: str, *,
-                       include_deleted: bool = False) -> dict | None:
+    async def get_node(self, node_id: str, *, include_deleted: bool = False) -> dict | None:
         if include_deleted:
             sql, params = "SELECT * FROM nodes WHERE id=?", (node_id,)
         else:
-            sql = ("SELECT * FROM nodes WHERE id=? "
-                   "AND (valid_until IS NULL OR valid_until > ?)")
+            sql = "SELECT * FROM nodes WHERE id=? AND (valid_until IS NULL OR valid_until > ?)"
             params = (node_id, _now())
         async with self._read.execute(sql, params) as cur:
             row = await cur.fetchone()
@@ -145,13 +196,13 @@ class Storage:
         ids = list(ids)
         if not ids:
             return []
-        async with self._read.execute(
-                f"SELECT * FROM nodes WHERE id IN ({_ph(ids)})", ids) as cur:
+        async with self._read.execute(f"SELECT * FROM nodes WHERE id IN ({_ph(ids)})", ids) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-    async def fetch_nodes_by_session(self, session_id: str,
-                                     since_ts: int | None = None) -> list[dict]:
+    async def fetch_nodes_by_session(
+        self, session_id: str, since_ts: int | None = None
+    ) -> list[dict]:
         sql = "SELECT * FROM nodes WHERE session_id=?"
         params: list[Any] = [session_id]
         if since_ts is not None:
@@ -162,8 +213,9 @@ class Storage:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-    async def update_node_fields(self, node_id: str, fields: dict, *,
-                                 wait: bool = True) -> int | None:
+    async def update_node_fields(
+        self, node_id: str, fields: dict, *, wait: bool = True
+    ) -> int | None:
         bad = set(fields) - NODE_UPDATE_ALLOW
         if bad:
             raise ValueError(f"fields not updatable: {sorted(bad)}")
@@ -175,7 +227,8 @@ class Storage:
             params.append(val)
         params.append(node_id)
         return await self._q.execute(
-            f"UPDATE nodes SET {', '.join(sets)} WHERE id=?", tuple(params), wait=wait)
+            f"UPDATE nodes SET {', '.join(sets)} WHERE id=?", tuple(params), wait=wait
+        )
 
     async def access_nodes(self, ids, now=None):
         """Reinforce ONLY the top-3 ranked hits. Fire-and-forget friendly.
@@ -189,63 +242,82 @@ class Storage:
         now = now or _now()
         ph = ",".join("?" for _ in ids)
         if self._db.has_math_functions:
-            return await self._q.execute(
-                f"UPDATE nodes SET last_accessed=?, access_count=access_count+1, "
-                f"confidence=MIN(1.0, confidence * (1 + LN(access_count + 2) / 10)) "
-                f"WHERE id IN ({ph}) AND valid_until IS NULL",
-                (now, *ids), wait=False) or 0
+            return (
+                await self._q.execute(
+                    f"UPDATE nodes SET last_accessed=?, access_count=access_count+1, "
+                    f"confidence=MIN(1.0, confidence * (1 + LN(access_count + 2) / 10)) "
+                    f"WHERE id IN ({ph}) AND valid_until IS NULL",
+                    (now, *ids),
+                    wait=False,
+                )
+                or 0
+            )
         # Fallback: no math functions -> just touch the access metadata
-        return await self._q.execute(
-            f"UPDATE nodes SET last_accessed=?, access_count=access_count+1 "
-            f"WHERE id IN ({ph}) AND valid_until IS NULL",
-            (now, *ids), wait=False) or 0
+        return (
+            await self._q.execute(
+                f"UPDATE nodes SET last_accessed=?, access_count=access_count+1 "
+                f"WHERE id IN ({ph}) AND valid_until IS NULL",
+                (now, *ids),
+                wait=False,
+            )
+            or 0
+        )
 
-    async def soft_delete_nodes(self, ids: Sequence[str], *,
-                                wait: bool = True) -> int | None:
+    async def soft_delete_nodes(self, ids: Sequence[str], *, wait: bool = True) -> int | None:
         ids = list(ids)
         if not ids:
             return 0
         return await self._q.execute(
-            f"UPDATE nodes SET valid_until=? WHERE id IN ({_ph(ids)}) "
-            "AND valid_until IS NULL", (_now(), *ids), wait=wait)
+            f"UPDATE nodes SET valid_until=? WHERE id IN ({_ph(ids)}) AND valid_until IS NULL",
+            (_now(), *ids),
+            wait=wait,
+        )
 
-    async def hard_delete_nodes(self, ids: Sequence[str], *,
-                                wait: bool = True) -> int | None:
+    async def hard_delete_nodes(self, ids: Sequence[str], *, wait: bool = True) -> int | None:
         ids = list(ids)
         if not ids:
             return 0
         ph = _ph(ids)
-        return await self._q.transaction([
-            (f"DELETE FROM vec_nodes WHERE node_id IN ({ph})", ids),
-            (f"DELETE FROM node_entities WHERE node_id IN ({ph})", ids),
-            (f"DELETE FROM edges WHERE source_id IN ({ph}) OR target_id IN ({ph})", ids),
-            (f"DELETE FROM nodes WHERE id IN ({ph})", ids),
-        ], wait=wait)
+        return await self._q.transaction(
+            [
+                (f"DELETE FROM vec_nodes WHERE node_id IN ({ph})", ids),
+                (f"DELETE FROM node_entities WHERE node_id IN ({ph})", ids),
+                (f"DELETE FROM edges WHERE source_id IN ({ph}) OR target_id IN ({ph})", ids),
+                (f"DELETE FROM nodes WHERE id IN ({ph})", ids),
+            ],
+            wait=wait,
+        )
 
     async def nodes_without_vectors(self, limit: int = 200) -> list[str]:
         async with self._read.execute(
-                "SELECT id FROM nodes WHERE needs_embedding=1 "
-                "ORDER BY rowid LIMIT ?", (limit,)) as cur:
+            "SELECT id FROM nodes WHERE needs_embedding=1 ORDER BY rowid LIMIT ?", (limit,)
+        ) as cur:
             rows = await cur.fetchall()
         return [r["id"] for r in rows]
 
-    async def insert_embedding_and_clear_flag(self, node_id: str,
-                                              emb: Sequence[float], *,
-                                              wait: bool = True) -> int | None:
+    async def insert_embedding_and_clear_flag(
+        self, node_id: str, emb: Sequence[float], *, wait: bool = True
+    ) -> int | None:
         """One transaction: vector upsert + flag clear (no orphan vectors)."""
-        return await self._q.transaction([
-            self._vec_stmt(node_id, emb),
-            ("UPDATE nodes SET needs_embedding=0 WHERE id=?", (node_id,)),
-        ], wait=wait)
+        return await self._q.transaction(
+            [
+                self._vec_stmt(node_id, emb),
+                ("UPDATE nodes SET needs_embedding=0 WHERE id=?", (node_id,)),
+            ],
+            wait=wait,
+        )
 
     # ------------------------------------------------------------ edges
     async def insert_edge(self, data: dict, *, wait: bool = True) -> str | None:
         stmt = self.edge_stmt(
-            data["source_id"], data["target_id"], data["relation_type"],
+            data["source_id"],
+            data["target_id"],
+            data["relation_type"],
             confidence=data.get("confidence", 1.0),
             weight=data.get("weight", 1.0),
             predicate=data.get("predicate"),
-            evidence=data.get("evidence"))
+            evidence=data.get("evidence"),
+        )
         n = await self._q.execute(stmt[0], stmt[1], wait=wait)
         return stmt[1][0] if (n or 0) > 0 else None
 
@@ -262,9 +334,15 @@ class Storage:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------ entities
-    async def upsert_entity(self, *, name_norm: str, canonical: str,
-                            etype: str = "concept", summary=None,
-                            wait: bool = True) -> str:
+    async def upsert_entity(
+        self,
+        *,
+        name_norm: str,
+        canonical: str,
+        etype: str = "concept",
+        summary=None,
+        wait: bool = True,
+    ) -> str:
         """Never clobber aliases/attributes/canonical; upgrade concept->specific."""
         sql = """
             INSERT INTO entities(id, name_norm, canonical_name, type, aliases,
@@ -278,15 +356,16 @@ class Storage:
                             THEN excluded.type ELSE entities.type END,
                 summary = COALESCE(excluded.summary, entities.summary)"""
         now = _now()
-        await self._q.execute(sql, (uuid.uuid4().hex, name_norm, canonical,
-                                    etype, summary, now, now), wait=wait)
+        await self._q.execute(
+            sql, (uuid.uuid4().hex, name_norm, canonical, etype, summary, now, now), wait=wait
+        )
         async with self._db.get_read_connection().execute(
-                "SELECT id FROM entities WHERE name_norm=?", (name_norm,)) as cur:
+            "SELECT id FROM entities WHERE name_norm=?", (name_norm,)
+        ) as cur:
             row = await cur.fetchone()
         return row["id"]
 
-    async def merge_alias(self, entity_id: str, alias: str,
-                          wait: bool = True) -> None:
+    async def merge_alias(self, entity_id: str, alias: str, wait: bool = True) -> None:
         """Atomic append: no read-merge-write race between concurrent ensures.
 
         Uses json_array_length instead of '$[#]' so it also works on SQLite < 3.31.
@@ -297,31 +376,43 @@ class Storage:
                        '$[' || json_array_length(aliases) || ']', ?)
                WHERE id = ? AND canonical_name <> ?
                  AND NOT EXISTS (SELECT 1 FROM json_each(aliases) WHERE value = ?)""",
-            (alias, entity_id, alias, alias), wait=wait)
+            (alias, entity_id, alias, alias),
+            wait=wait,
+        )
 
     def link_entities_stmts(self, node_id: str, entity_ids) -> list[tuple[str, tuple]]:
-        return [("INSERT OR IGNORE INTO node_entities(node_id, entity_id) "
-                 "VALUES (?,?)", (node_id, eid)) for eid in entity_ids]
+        return [
+            ("INSERT OR IGNORE INTO node_entities(node_id, entity_id) VALUES (?,?)", (node_id, eid))
+            for eid in entity_ids
+        ]
 
     async def last_episode_id(self, session_id: str):
         async with self._db.get_read_connection().execute(
-                "SELECT id FROM nodes WHERE type='episodic' AND session_id=? "
-                "ORDER BY event_time DESC, rowid DESC LIMIT 1",
-                (session_id,)) as cur:
+            "SELECT id FROM nodes WHERE type='episodic' AND session_id=? "
+            "ORDER BY event_time DESC, rowid DESC LIMIT 1",
+            (session_id,),
+        ) as cur:
             row = await cur.fetchone()
         return row["id"] if row else None
 
-    async def link_node_entity(self, node_id: str, entity_id: str, *,
-                               wait: bool = True) -> int | None:
+    async def link_node_entity(
+        self, node_id: str, entity_id: str, *, wait: bool = True
+    ) -> int | None:
         return await self._q.execute(
             "INSERT OR IGNORE INTO node_entities(node_id, entity_id) VALUES (?,?)",
-            (node_id, entity_id), wait=wait)
+            (node_id, entity_id),
+            wait=wait,
+        )
 
-    async def link_nodes_entities(self, pairs: Sequence[tuple[str, str]], *,
-                                  wait: bool = True) -> int | None:
+    async def link_nodes_entities(
+        self, pairs: Sequence[tuple[str, str]], *, wait: bool = True
+    ) -> int | None:
         return await self._q.execute(
             "INSERT OR IGNORE INTO node_entities(node_id, entity_id) VALUES (?,?)",
-            [list(p) for p in pairs], wait=wait, many=True)
+            [list(p) for p in pairs],
+            wait=wait,
+            many=True,
+        )
 
     async def get_entities_for_nodes(self, node_ids: Sequence[str]) -> dict[str, list[dict]]:
         node_ids = list(node_ids)
@@ -339,14 +430,12 @@ class Storage:
         return out
 
     async def get_entity(self, entity_id: str) -> dict | None:
-        async with self._read.execute(
-                "SELECT * FROM entities WHERE id=?", (entity_id,)) as cur:
+        async with self._read.execute("SELECT * FROM entities WHERE id=?", (entity_id,)) as cur:
             row = await cur.fetchone()
         return dict(row) if row else None
 
     async def get_entity_by_norm(self, norm: str) -> dict | None:
-        async with self._read.execute(
-                "SELECT * FROM entities WHERE name_norm=?", (norm,)) as cur:
+        async with self._read.execute("SELECT * FROM entities WHERE name_norm=?", (norm,)) as cur:
             row = await cur.fetchone()
         return dict(row) if row else None
 
@@ -355,56 +444,75 @@ class Storage:
         if not ids:
             return []
         async with self._read.execute(
-                f"SELECT * FROM entities WHERE id IN ({_ph(ids)})", ids) as cur:
+            f"SELECT * FROM entities WHERE id IN ({_ph(ids)})", ids
+        ) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
     async def fetch_nodes_for_entity(self, entity_id: str) -> list[dict]:
-        async with self._read.execute("""
+        async with self._read.execute(
+            """
                 SELECT n.* FROM nodes n JOIN node_entities ne ON ne.node_id = n.id
                 WHERE ne.entity_id = ? AND n.valid_until IS NULL""",
-                (entity_id,)) as cur:
+            (entity_id,),
+        ) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
     async def fetch_directives(self, limit: int = 50) -> list[dict]:
         """Hard constraints (metadata.kind) + pinned opinions. Constraints first."""
-        async with self._read.execute("""
+        async with self._read.execute(
+            """
                 SELECT id, type, content, metadata FROM nodes
                 WHERE valid_until IS NULL
                   AND ((type = 'opinion' AND decay_rate = 0.0)
                        OR json_extract(metadata, '$.kind') = 'constraint')
                 ORDER BY CASE WHEN json_extract(metadata, '$.kind') = 'constraint'
                               THEN 0 ELSE 1 END, event_time DESC
-                LIMIT ?""", (limit,)) as cur:
+                LIMIT ?""",
+            (limit,),
+        ) as cur:
             rows = await cur.fetchall()
         out = []
         for r in rows:
             meta = json.loads(r["metadata"] or "{}")
-            out.append({"id": r["id"], "type": r["type"],
-                        "kind": ("constraint" if meta.get("kind") == "constraint"
-                                 else "preference"),
-                        "content": r["content"]})
+            out.append(
+                {
+                    "id": r["id"],
+                    "type": r["type"],
+                    "kind": ("constraint" if meta.get("kind") == "constraint" else "preference"),
+                    "content": r["content"],
+                }
+            )
         return out
 
     async def fetch_profile(self, limit: int = 10) -> list[dict]:
         """Pinned semantic facts: the stable user profile."""
-        async with self._read.execute("""
+        async with self._read.execute(
+            """
                 SELECT id, type, content FROM nodes
                 WHERE valid_until IS NULL AND type = 'semantic' AND decay_rate = 0.0
-                ORDER BY event_time DESC LIMIT ?""", (limit,)) as cur:
+                ORDER BY event_time DESC LIMIT ?""",
+            (limit,),
+        ) as cur:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
-    async def fetch_episodes(self, *, entity_id: str | None = None,
-                             time_from: int | None = None,
-                             time_to: int | None = None,
-                             limit: int = 20) -> list[dict]:
+    async def fetch_episodes(
+        self,
+        *,
+        entity_id: str | None = None,
+        time_from: int | None = None,
+        time_to: int | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
         sql = "SELECT n.* FROM nodes n WHERE n.type='episodic' AND n.valid_until IS NULL"
         params: list[Any] = []
         if entity_id:
-            sql += (" AND EXISTS(SELECT 1 FROM node_entities ne "
-                    "WHERE ne.node_id=n.id AND ne.entity_id=?)")
+            sql += (
+                " AND EXISTS(SELECT 1 FROM node_entities ne "
+                "WHERE ne.node_id=n.id AND ne.entity_id=?)"
+            )
             params.append(entity_id)
         if time_from is not None:
             sql += " AND n.event_time >= ?"
@@ -419,46 +527,73 @@ class Storage:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------ composite ops
-    async def create_fact(self, *, content: str, node_type: str,
-                          confidence: float = 0.9,
-                          decay_rate: float | None = None,
-                          embedding: Sequence[float] | None = None,
-                          session_id: str | None = None,
-                          event_time: int | None = None,
-                          entity_ids: Sequence[str] = (),
-                          source_episode_ids: Sequence[str] = (),
-                          metadata: dict | None = None,
-                          wait: bool = True) -> str:
+    async def create_fact(
+        self,
+        *,
+        content: str,
+        node_type: str,
+        confidence: float = 0.9,
+        decay_rate: float | None = None,
+        embedding: Sequence[float] | None = None,
+        session_id: str | None = None,
+        event_time: int | None = None,
+        entity_ids: Sequence[str] = (),
+        source_episode_ids: Sequence[str] = (),
+        metadata: dict | None = None,
+        wait: bool = True,
+    ) -> str:
         """Node + vector + entity links + derived_from edges in ONE transaction."""
-        stmt, nid = self.node_stmt({
-            "type": node_type, "content": content, "confidence": confidence,
-            "decay_rate": decay_rate, "session_id": session_id,
-            "event_time": event_time, "needs_embedding": embedding is None,
-            "metadata": metadata,
-        })
+        stmt, nid = self.node_stmt(
+            {
+                "type": node_type,
+                "content": content,
+                "confidence": confidence,
+                "decay_rate": decay_rate,
+                "session_id": session_id,
+                "event_time": event_time,
+                "needs_embedding": embedding is None,
+                "metadata": metadata,
+            }
+        )
         stmts = [stmt]
         if embedding is not None:
             stmts.append(self._vec_stmt(nid, embedding))
-        stmts += [("INSERT OR IGNORE INTO node_entities(node_id, entity_id) VALUES (?,?)",
-                   (nid, eid)) for eid in entity_ids]
-        stmts += [self.edge_stmt(nid, ep, "derived_from", confidence=confidence)
-                  for ep in source_episode_ids]
+        stmts += [
+            ("INSERT OR IGNORE INTO node_entities(node_id, entity_id) VALUES (?,?)", (nid, eid))
+            for eid in entity_ids
+        ]
+        stmts += [
+            self.edge_stmt(nid, ep, "derived_from", confidence=confidence)
+            for ep in source_episode_ids
+        ]
         await self._q.transaction(stmts, wait=wait)
         return nid
 
-    async def supersede_fact(self, old_id, *, node_type: str = "semantic",
-                             content, confidence=0.9,
-                             embedding=None, source_episode_ids=(),
-                             entity_ids=(), wait: bool = True) -> str:
+    async def supersede_fact(
+        self,
+        old_id,
+        *,
+        node_type: str = "semantic",
+        content,
+        confidence=0.9,
+        embedding=None,
+        source_episode_ids=(),
+        entity_ids=(),
+        wait: bool = True,
+    ) -> str:
         """Caller passes the OLD node's type; procedural/opinion stay their type."""
         now = _now()
-        stmt, nid = self.node_stmt({
-            "type": node_type, "content": content, "confidence": confidence,
-            "event_time": now, "needs_embedding": embedding is None,
-        })
+        stmt, nid = self.node_stmt(
+            {
+                "type": node_type,
+                "content": content,
+                "confidence": confidence,
+                "event_time": now,
+                "needs_embedding": embedding is None,
+            }
+        )
         stmts = [
-            ("UPDATE nodes SET valid_until=? WHERE id=? AND valid_until IS NULL",
-             (now, old_id)),
+            ("UPDATE nodes SET valid_until=? WHERE id=? AND valid_until IS NULL", (now, old_id)),
             stmt,
             self.edge_stmt(nid, old_id, "supersedes", predicate="replaces"),
         ]
@@ -471,11 +606,13 @@ class Storage:
         await self._q.transaction(stmts, wait=wait)
         return nid
 
-    async def merge_duplicate_facts(self, keeper_id: str, loser_id: str, *,
-                                    wait: bool = True) -> None:
+    async def merge_duplicate_facts(
+        self, keeper_id: str, loser_id: str, *, wait: bool = True
+    ) -> None:
         """Retro-dedup: keeper inherits provenance/entity links, loser is soft-deleted."""
         stmts = [
-            ("""INSERT INTO edges(id, source_id, target_id, relation_type, predicate,
+            (
+                """INSERT INTO edges(id, source_id, target_id, relation_type, predicate,
                                   weight, confidence, valid_from, valid_until,
                                   evidence, created_at)
                 SELECT lower(hex(randomblob(16))), ?, e.target_id, e.relation_type,
@@ -484,44 +621,52 @@ class Storage:
                 FROM edges e
                 WHERE e.source_id = ? AND e.relation_type = 'derived_from'
                   AND e.valid_until IS NULL
-                ON CONFLICT DO NOTHING""", (keeper_id, loser_id)),
-            ("""INSERT OR IGNORE INTO node_entities(node_id, entity_id)
+                ON CONFLICT DO NOTHING""",
+                (keeper_id, loser_id),
+            ),
+            (
+                """INSERT OR IGNORE INTO node_entities(node_id, entity_id)
                 SELECT ?, entity_id FROM node_entities WHERE node_id = ?""",
-             (keeper_id, loser_id)),
-            ("UPDATE nodes SET valid_until=? WHERE id=? AND valid_until IS NULL",
-             (_now(), loser_id)),
+                (keeper_id, loser_id),
+            ),
+            (
+                "UPDATE nodes SET valid_until=? WHERE id=? AND valid_until IS NULL",
+                (_now(), loser_id),
+            ),
         ]
         await self._q.transaction(stmts, wait=wait)
 
     # ------------------------------------------------------------ sessions
-    async def mark_session_consolidated(self, session_id: str,
-                                        ts: int | None = None, *,
-                                        wait: bool = True) -> int | None:
+    async def mark_session_consolidated(
+        self, session_id: str, ts: int | None = None, *, wait: bool = True
+    ) -> int | None:
         return await self._q.execute(
             """INSERT INTO sessions(session_id, consolidated_at) VALUES (?,?)
                ON CONFLICT(session_id) DO UPDATE SET consolidated_at=excluded.consolidated_at""",
-            (session_id, ts or _now()), wait=wait)
+            (session_id, ts or _now()),
+            wait=wait,
+        )
 
     async def session_consolidated_at(self, session_id: str) -> int | None:
         async with self._read.execute(
-                "SELECT consolidated_at FROM sessions WHERE session_id=?",
-                (session_id,)) as cur:
+            "SELECT consolidated_at FROM sessions WHERE session_id=?", (session_id,)
+        ) as cur:
             row = await cur.fetchone()
         return row["consolidated_at"] if row else None
 
     # ------------------------------------------------------------ meta
     async def meta_get(self, key: str) -> str | None:
-        async with self._read.execute(
-                "SELECT value FROM meta WHERE key=?", (key,)) as cur:
+        async with self._read.execute("SELECT value FROM meta WHERE key=?", (key,)) as cur:
             row = await cur.fetchone()
         return row["value"] if row else None
 
-    async def meta_set(self, key: str, value: str, *,
-                       wait: bool = True) -> int | None:
+    async def meta_set(self, key: str, value: str, *, wait: bool = True) -> int | None:
         return await self._q.execute(
             "INSERT INTO meta(key, value) VALUES (?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value), wait=wait)
+            (key, value),
+            wait=wait,
+        )
 
     # ------------------------------------------------------------ add methods
     async def fetch_entities_for_node(self, node_id: str) -> list[dict]:
@@ -529,10 +674,14 @@ class Storage:
         result = await self.get_entities_for_nodes([node_id])
         return result.get(node_id, [])
 
-    async def fetch_timeline(self, *, entity_id: str | None = None,
-                             time_from: int | None = None,
-                             time_to: int | None = None,
-                             limit: int = 20) -> list[dict]:
+    async def fetch_timeline(
+        self,
+        *,
+        entity_id: str | None = None,
+        time_from: int | None = None,
+        time_to: int | None = None,
+        limit: int = 20,
+    ) -> list[dict]:
         """Last N episodes in chronological (ASC) order.
 
         Two-step approach: first query gets last N by DESC, then Python sorts ASC.
@@ -541,8 +690,10 @@ class Storage:
         sql = "SELECT n.* FROM nodes n WHERE n.type='episodic' AND n.valid_until IS NULL"
         params: list[Any] = []
         if entity_id:
-            sql += (" AND EXISTS(SELECT 1 FROM node_entities ne "
-                    "WHERE ne.node_id=n.id AND ne.entity_id=?)")
+            sql += (
+                " AND EXISTS(SELECT 1 FROM node_entities ne "
+                "WHERE ne.node_id=n.id AND ne.entity_id=?)"
+            )
             params.append(entity_id)
         if time_from is not None:
             sql += " AND n.event_time >= ?"
@@ -572,7 +723,8 @@ class Storage:
             edges_by_type = {r["relation_type"]: r["cnt"] for r in await cur.fetchall()}
 
         async with self._read.execute(
-                "SELECT type, COUNT(*) AS cnt FROM entities GROUP BY type") as cur:
+            "SELECT type, COUNT(*) AS cnt FROM entities GROUP BY type"
+        ) as cur:
             entities_by_type = {r["type"]: r["cnt"] for r in await cur.fetchall()}
 
         async with self._read.execute("""
@@ -586,8 +738,8 @@ class Storage:
         orphans = row["cnt"] if row else 0
 
         async with self._read.execute(
-                "SELECT COUNT(*) AS cnt FROM nodes "
-                "WHERE needs_embedding = 1 AND valid_until IS NULL") as cur:
+            "SELECT COUNT(*) AS cnt FROM nodes WHERE needs_embedding = 1 AND valid_until IS NULL"
+        ) as cur:
             row = await cur.fetchone()
         pending_embeddings = row["cnt"] if row else 0
 
@@ -607,12 +759,15 @@ class Storage:
     async def provenance(self, node_id: str) -> tuple[list[dict], list[dict], list[dict]]:
         """Source episodes, supersedes chain, linked entities."""
         # Sources (derived_from edges)
-        async with self._read.execute("""
+        async with self._read.execute(
+            """
                 SELECT n.* FROM nodes n
                 JOIN edges e ON e.target_id=n.id
                 WHERE e.source_id=? AND e.relation_type='derived_from'
                   AND n.type='episodic'
-                ORDER BY n.event_time""", (node_id,)) as cur:
+                ORDER BY n.event_time""",
+            (node_id,),
+        ) as cur:
             sources = [dict(r) for r in await cur.fetchall()]
 
         # Supersedes chain (walk backwards)
@@ -621,10 +776,13 @@ class Storage:
         visited = set()
         while current and current not in visited:
             visited.add(current)
-            async with self._read.execute("""
+            async with self._read.execute(
+                """
                     SELECT target_id FROM edges
                     WHERE source_id=? AND relation_type='supersedes'
-                    LIMIT 1""", (current,)) as cur:
+                    LIMIT 1""",
+                (current,),
+            ) as cur:
                 row = await cur.fetchone()
             if row:
                 old_id = row["target_id"]
@@ -639,10 +797,13 @@ class Storage:
         entities = await self.fetch_entities_for_node(node_id)
         return sources, superseded, entities
 
-    async def insert_entity_embedding(self, entity_id: str, emb: Sequence[float], *,
-                                      wait: bool = True) -> int | None:
+    async def insert_entity_embedding(
+        self, entity_id: str, emb: Sequence[float], *, wait: bool = True
+    ) -> int | None:
         """Store embedding vector for entity."""
         vec_data = sqlite_vec.serialize_float32([float(x) for x in emb])
         return await self._q.execute(
             "INSERT OR REPLACE INTO vec_entities(entity_id, embedding) VALUES (?,?)",
-            (entity_id, vec_data), wait=wait)
+            (entity_id, vec_data),
+            wait=wait,
+        )
