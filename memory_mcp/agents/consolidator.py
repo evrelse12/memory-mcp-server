@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 
 from memory_mcp.agents.llm_client import LLMClient
 from memory_mcp.config.settings import settings
@@ -147,16 +148,22 @@ class Consolidator:
                     [{"role": "user",
                       "content": CONFLICT_PROMPT.format(
                           a=existing["content"], b=fact["content"])}],
-                    max_tokens=8, temperature=0.0)
-                word = answer.strip().casefold()
-                if word.startswith("same"):
+                    max_tokens=64, temperature=0.0)
+                words = re.findall(r"\b(same|contradicts|different)\b", answer.lower())
+                verdict = words[-1] if words else None
+                if verdict is None:
+                    logger.warning(
+                        "conflict arbitration inconclusive for %s; inserting as new",
+                        existing["id"])
+                elif verdict == "same":
                     continue
-                if word.startswith("contradicts"):
+                elif verdict == "contradicts":
                     await self._s.supersede_fact(
                         existing["id"], node_type=existing["type"],
                         content=fact["content"], confidence=fact["confidence"],
                         embedding=emb, source_episode_ids=src_ids, entity_ids=eids)
                     continue
+                # "different" or inconclusive -> insert as a new fact
                 # "different" -> insert as a new fact
             await self._s.create_fact(
                 content=fact["content"], node_type=fact["type"],

@@ -1,4 +1,4 @@
-# agents/llm_client.py
+# memory_mcp/agents/llm_client.py
 """Single shared LLM client: one httpx client, one retry, optional JSON mode."""
 from __future__ import annotations
 
@@ -14,10 +14,8 @@ from memory_mcp.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-
 class LLMError(RuntimeError):
     pass
-
 
 class LLMClient:
     def __init__(self, base_url: str | None = None, model: str | None = None):
@@ -25,6 +23,9 @@ class LLMClient:
         self._client = httpx.AsyncClient(
             base_url=base_url or settings.llm_api_url,
             timeout=httpx.Timeout(settings.llm_timeout, connect=5.0))
+        self.last_finish_reason: str | None = None
+        self.last_content_chars: int = 0
+        self.last_from_reasoning: bool = False
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -40,7 +41,26 @@ class LLMClient:
             try:
                 resp = await self._client.post("/v1/chat/completions", json=payload)
                 resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
+                choice = resp.json()["choices"][0]
+                msg = choice["message"]
+                content = msg.get("content") or ""
+                reasoning = msg.get("reasoning_content") or ""
+                self.last_finish_reason = choice.get("finish_reason")
+                self.last_from_reasoning = False
+                # Reasoning models may emit a short answer entirely in the
+                # reasoning channel, leaving content empty. Use it only when
+                # generation completed (never salvage truncated thinking).
+                if (not content.strip() and reasoning.strip()
+                        and self.last_finish_reason != "length"):
+                    content = reasoning
+                    self.last_from_reasoning = True
+                    logger.debug("LLM content taken from reasoning channel")
+                self.last_content_chars = len(content)
+                if not content.strip():
+                    logger.warning(
+                        "LLM empty content (finish_reason=%s, max_tokens=%s, model=%s)",
+                        self.last_finish_reason, max_tokens, self._model)
+                return content
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as e:
                 last = e
                 if attempt == 1:

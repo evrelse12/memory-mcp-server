@@ -24,3 +24,7 @@ htmlcov/
 .vscode/
 .DS_Store
 scripts/
+bench/results/
+bench/.cache/
+bench/*.json
+bench/data/

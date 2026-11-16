@@ -1,5 +1,5 @@
-# mcp_server/server.py
-"""Memory MCP server (stdio only). Graceful shutdown; short model instructions."""
+# memory_mcp/mcp_server/server.py
+"""Memory MCP server (stdio). Graceful shutdown; short model instructions."""
 from __future__ import annotations
 
 import asyncio
@@ -25,6 +25,7 @@ from memory_mcp.core.database import Database
 from memory_mcp.core.storage import Storage
 from memory_mcp.core.tasks import drain as drain_tasks
 from memory_mcp.core.write_queue import WriteQueue
+from memory_mcp.prompts import SYSTEM_PROMPT_EN, SYSTEM_PROMPT_RU
 from memory_mcp.services.decay import DecayService
 from memory_mcp.services.embedding import EmbeddingService
 from memory_mcp.services.entity_index import EntityIndex
@@ -37,10 +38,12 @@ logger = logging.getLogger(__name__)
 # Short on purpose: small models follow few crisp rules better than long essays.
 SERVER_INSTRUCTIONS = (
     "You have persistent long-term memory. Every turn: first call record_message "
-    "with the user's exact text. Before answering about the user, people, projects "
-    "or the past, call search_memory. Store durable facts with remember_fact; "
-    "replace contradictions with correct_fact; pin with confirm_fact; delete with "
-    "forget_fact. Never guess from context alone.")
+    "with the user's exact text, then call get_turn_context with the user's "
+    "message and follow its Directives. Store durable facts with remember_fact; "
+    "use constraint=true for strict rules. If a response has "
+    "requires_user_clarification=true, ask the user before changing the stored "
+    "fact. Replace outdated facts with correct_fact; pin with confirm_fact; "
+    "delete with forget_fact. Never guess from context alone.")
 
 @dataclass
 class AppContext:
@@ -166,7 +169,28 @@ async def lifespan(server):
         await teardown(ctx)
         ctx = None
 
-mcp = FastMCP("memory-server", instructions=SERVER_INSTRUCTIONS, lifespan=lifespan)
+def _is_loopback(host: str) -> bool:
+    return host in ("127.0.0.1", "::1", "localhost")
+
+def _build_auth():
+    if not settings.http_token:
+        return None
+    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+    return StaticTokenVerifier(
+        tokens={settings.http_token: {"client_id": "memory-client",
+                                      "scopes": ["memory"]}},
+        required_scopes=["memory"],
+    )
+
+def _validate_http_settings() -> None:
+    if not settings.http_token and not _is_loopback(settings.http_host):
+        raise RuntimeError(
+            "MEMORY_HTTP_TOKEN is required when MEMORY_HTTP_HOST is not loopback "
+            f"(got {settings.http_host!r}). Generate one with: "
+            'python -c "import secrets; print(secrets.token_urlsafe(32))"')
+
+mcp = FastMCP("memory-server", instructions=SERVER_INSTRUCTIONS,
+              lifespan=lifespan, auth=_build_auth())
 
 def tool_errors(fn):
     @wraps(fn)
@@ -196,6 +220,24 @@ async def record_message(
 
 @mcp.tool(annotations={"readOnlyHint": True})
 @tool_errors
+async def get_turn_context(
+    user_message: Annotated[str, Field(description="The user's current message")],
+    limit: Annotated[int, Field(ge=1, le=30)] = 8,
+) -> dict:
+    """One-call memory context: directives + profile + relevant facts as a ready
+    <user_memory> block. Call after record_message, before answering."""
+    return await ctx.tools.get_turn_context(user_message, limit=limit)
+
+@mcp.tool(annotations={"readOnlyHint": True})
+@tool_errors
+async def get_active_directives(
+    limit: Annotated[int, Field(ge=1, le=100)] = 50,
+) -> list[dict]:
+    """Hard constraints and pinned preferences (absolute priority)."""
+    return await ctx.tools.get_active_directives(limit=limit)
+
+@mcp.tool(annotations={"readOnlyHint": True})
+@tool_errors
 async def search_memory(
     query: Annotated[str, Field(description="Question or keywords, RU or EN")],
     node_types: Annotated[
@@ -218,6 +260,8 @@ async def remember_fact(
     pin: Annotated[bool, Field(description="Protect from forgetting")] = False,
     force: Annotated[bool, Field(
         description="Store even if a similar fact already exists")] = False,
+    constraint: Annotated[bool, Field(
+        description="Hard rule: pinned forever, always in Directives")] = False,
     session_id: Annotated[str | None, Field(max_length=64,
         description="Host chat/conversation id; omit for auto-managed session")] = None,
 ) -> dict:
@@ -226,7 +270,8 @@ async def remember_fact(
     ep = await ctx.storage.last_episode_id(sid)
     return await ctx.tools.remember_fact(
         content, node_type=node_type, confidence=confidence, entities=entities,
-        pin=pin, force=force, source_episode_ids=[ep] if ep else ())
+        pin=pin, force=force, constraint=constraint,
+        source_episode_ids=[ep] if ep else ())
 
 @mcp.tool(annotations={"destructiveHint": True})
 @tool_errors
@@ -305,6 +350,54 @@ async def weak_facts(
     """Facts fading below effective confidence 0.3."""
     return await ctx.tools.weak_facts(limit=limit)
 
+@mcp.prompt()
+def memory_protocol(language: str = "en") -> str:
+    """Reference system prompt for hosts: the per-turn memory protocol."""
+    return SYSTEM_PROMPT_RU if language.lower().startswith("ru") else SYSTEM_PROMPT_EN
+
+# ---------------------------------------------------------------- resources
+# MCP resources are application-driven: the host decides whether to inject them.
+# priority/audience are hints (1.0 = effectively required), never a guarantee.
+def _res_kwargs(priority: float) -> dict:
+    """text/markdown + spec annotations, if this FastMCP version accepts them."""
+    import inspect
+    kw: dict = {"mime_type": "text/markdown"}
+    params = inspect.signature(mcp.resource).parameters
+    if ("annotations" in params
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())):
+        kw["annotations"] = {"audience": ["assistant"], "priority": priority}
+    return kw
+
+@mcp.resource("memory://user/profile", **_res_kwargs(1.0))
+async def user_profile_resource() -> str:
+    """Stable facts about the user (pinned semantic nodes)."""
+    return await ctx.tools.render_profile()
+
+@mcp.resource("memory://user/constraints", **_res_kwargs(1.0))
+async def user_constraints_resource() -> str:
+    """Hard rules that always apply."""
+    return await ctx.tools.render_constraints()
+
+@mcp.resource("memory://user/preferences", **_res_kwargs(0.8))
+async def user_preferences_resource() -> str:
+    """Pinned soft preferences."""
+    return await ctx.tools.render_preferences()
+
+@mcp.resource("memory://episodes/recent", **_res_kwargs(0.3))
+async def recent_episodes_resource() -> str:
+    """Last dialogue episodes, chronological."""
+    return await ctx.tools.render_recent_episodes()
+
+@mcp.resource("memory://entities/{entity_id}", **_res_kwargs(0.5))
+async def entity_resource(entity_id: str) -> str:
+    """Entity profile: summary, aliases, linked facts."""
+    return await ctx.tools.render_entity(entity_id)
+
+@mcp.resource("memory://session/{session_id}/summary", **_res_kwargs(0.6))
+async def session_summary_resource(session_id: str) -> str:
+    """Extractive digest of one session: recent turns + its facts."""
+    return await ctx.tools.render_session_digest(session_id)
+
 def main() -> None:
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     if settings.log_to_file:
@@ -316,8 +409,18 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         handlers=handlers,
     )
-    logger.info("memory-mcp starting (stdio)")
-    mcp.run(transport="stdio")
+    if settings.transport == "http":
+        _validate_http_settings()
+        if not settings.http_token:
+            logger.warning("HTTP without token: loopback-only; do not expose to the network")
+        logger.info("memory-mcp starting (http://%s:%s%s)",
+                    settings.http_host, settings.http_port, settings.http_path)
+        mcp.run(transport="http", host=settings.http_host,
+                port=settings.http_port, path=settings.http_path)
+    else:
+        logging.getLogger("apscheduler").setLevel(logging.WARNING)
+        logger.info("memory-mcp starting (stdio)")
+        mcp.run(transport="stdio")
 
 if __name__ == "__main__":
     main()

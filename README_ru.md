@@ -155,7 +155,7 @@ cp .env.example .env
 "memory": {
   "command": "<project>/venv/bin/python3",
   "args": ["<project>/main.py"],
-  "env": { "FASTMCP_CHECK_FOR_UPDATES": "false" }
+  "env": { "FASTMCP_CHECK_FOR_UPDATES": "off" }
 }
 ```
 

@@ -2,6 +2,7 @@
 """Tool-layer orchestration over storage/search; auto entity extraction internal."""
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Sequence
@@ -15,6 +16,9 @@ from memory_mcp.services.search import SearchService
 logger = logging.getLogger(__name__)
 
 FACT_TYPES = {"semantic", "procedural", "opinion"}
+DIRECTIVES_LIMIT = 20
+PROFILE_LIMIT = 10
+WEAK_THRESHOLD = 0.3
 
 class MemoryToolError(Exception):
     """User-facing tool error (mapped to MCP ToolError by the server)."""
@@ -38,12 +42,102 @@ class MemoryTools:
             time_from=time_from, time_to=time_to,
             include_episodes=include_episodes)
 
+    async def get_turn_context(self, user_message: str, *, limit: int = 8) -> dict:
+        """One-call turn context: directives + profile + relevant facts.
+
+        Returns a ready-to-read <user_memory> block plus structured parts.
+        Weak facts (effective confidence < 0.3) are dropped; facts already
+        present in directives/profile are not repeated.
+        """
+        directives = await self._s.fetch_directives(DIRECTIVES_LIMIT)
+        profile = await self._s.fetch_profile(PROFILE_LIMIT)
+        hits = await self._search.search(user_message, limit=limit)
+        seen = {d["id"] for d in directives} | {p["id"] for p in profile}
+        facts = [h for h in hits
+                 if h["id"] not in seen and h["confidence"] >= WEAK_THRESHOLD]
+
+        lines = ["<user_memory>"]
+        if directives:
+            lines.append("## Directives (must follow)")
+            lines += [f"- [{d['kind']}] {d['content'][:300]}" for d in directives]
+        if profile:
+            lines.append("## User profile")
+            lines += [f"- {p['content'][:300]}" for p in profile]
+        if facts:
+            lines.append("## Relevant facts")
+            lines += [f"- ({f['type']}, {f['confidence']:.2f}) {f['content'][:300]}"
+                      for f in facts]
+        if len(lines) == 1:
+            lines.append("(no stored memory yet)")
+        lines.append("</user_memory>")
+        return {"block": "\n".join(lines), "directives": directives,
+                "profile": profile, "facts": facts}
+
+    async def get_active_directives(self, limit: int = 50) -> list[dict]:
+        """Hard constraints and pinned preferences, absolute priority."""
+        return await self._s.fetch_directives(limit)
+
+    # ------------------------------------------------------------ resources
+    @staticmethod
+    def _bullets(items: Sequence[str]) -> str:
+        return "\n".join(f"- {i}" for i in items) if items else "(empty)"
+
+    async def render_profile(self) -> str:
+        rows = await self._s.fetch_profile(20)
+        return "# User profile\n\n" + self._bullets([r["content"] for r in rows])
+
+    async def render_constraints(self) -> str:
+        rows = [d for d in await self._s.fetch_directives(100)
+                if d["kind"] == "constraint"]
+        return "# Constraints (must follow)\n\n" + self._bullets(
+            [d["content"] for d in rows])
+
+    async def render_preferences(self) -> str:
+        rows = [d for d in await self._s.fetch_directives(100)
+                if d["kind"] == "preference"]
+        return "# Preferences\n\n" + self._bullets([d["content"] for d in rows])
+
+    async def render_entity(self, entity_id: str) -> str:
+        ent = await self._s.get_entity(entity_id)
+        if not ent:
+            raise MemoryToolError(f"unknown entity id: {entity_id}")
+        nodes = await self._s.fetch_nodes_for_entity(entity_id)
+        aliases = json.loads(ent["aliases"] or "[]")
+        lines = [f"# {ent['canonical_name']}", ""]
+        if ent.get("summary"):
+            lines += [ent["summary"], ""]
+        if aliases:
+            lines += [f"Aliases: {', '.join(aliases)}", ""]
+        lines += ["## Linked facts",
+                  self._bullets([n["content"] for n in nodes[:20]])]
+        return "\n".join(lines)
+
+    async def render_recent_episodes(self, limit: int = 20) -> str:
+        rows = await self._s.fetch_timeline(limit=limit)
+        return "# Recent episodes\n\n" + self._bullets(
+            [r["content"][:300] for r in rows])
+
+    async def render_session_digest(self, session_id: str) -> str:
+        """Extractive digest (no LLM call): recent turns + facts of this session."""
+        rows = [r for r in await self._s.fetch_nodes_by_session(session_id)
+                if r["valid_until"] is None]
+        eps = [r for r in rows if r["type"] == "episodic"][-10:]
+        facts = [r for r in rows if r["type"] != "episodic"][:20]
+        return "\n".join([
+            f"# Session {session_id}", "",
+            "## Recent turns", self._bullets([e["content"][:300] for e in eps]), "",
+            "## Facts from this session",
+            self._bullets([f["content"] for f in facts]),
+        ])
+    # ------------------------------------------------------------ end resources
+
     async def remember_fact(self, content: str, *, node_type: str = "semantic",
                             confidence: float = 0.9,
                             entities: Sequence[str] | None = None,
                             source_episode_ids: Sequence[str] = (),
                             pin: bool = False,
-                            force: bool = False) -> dict:
+                            force: bool = False,
+                            constraint: bool = False) -> dict:
         if node_type not in FACT_TYPES:
             raise MemoryToolError(f"bad node_type: {node_type!r}")
         confidence = min(1.0, max(0.0, float(confidence)))
@@ -59,19 +153,34 @@ class MemoryTools:
         if action == "skip" and existing and not force:
             await self._s.access_nodes([existing["id"]])
             pinned = False
-            if pin:
+            if pin or constraint:
                 await self.confirm_fact(existing["id"])
                 pinned = True
+            if constraint:
+                # Upgrade the existing fact to a hard directive.
+                node = await self._s.get_node(existing["id"])
+                meta = json.loads(node["metadata"] or "{}")
+                meta["kind"] = "constraint"
+                await self._s.update_node_fields(existing["id"], {"metadata": meta})
             return {"status": "duplicate",
                     "existing_id": existing["id"],
                     "existing_content": existing["content"],
                     "pinned": pinned,
+                    "constraint": constraint,
                     "hint": "call correct_fact if the new text contradicts it"}
 
         if action == "conflict" and existing and not force:
             return {"status": "similar",
                     "existing_id": existing["id"],
                     "existing_content": existing["content"],
+                    "new_content": content,
+                    "requires_user_clarification": True,
+                    "clarification_prompt": (
+                        f"Stored fact: \"{existing['content']}\". "
+                        f"New statement: \"{content}\". "
+                        "Ask the user: is this a permanent change or a one-off "
+                        "exception? Permanent -> correct_fact(old_node_id, ...). "
+                        "One-off -> remember_fact(..., force=true)."),
                     "hint": "call correct_fact to replace it, or "
                             "remember_fact(force=true) to keep both"}
 
@@ -79,12 +188,14 @@ class MemoryTools:
         eids = [await self._ei.ensure(n) for n in names]
         nid = await self._s.create_fact(
             content=content, node_type=node_type,
-            confidence=1.0 if pin else confidence,
-            decay_rate=0.0 if pin else None,
+            confidence=1.0 if (pin or constraint) else confidence,
+            decay_rate=0.0 if (pin or constraint) else None,
             embedding=emb, entity_ids=eids,
-            source_episode_ids=list(source_episode_ids))
+            source_episode_ids=list(source_episode_ids),
+            metadata={"kind": "constraint"} if constraint else None)
         return {"status": "created", "node_id": nid,
-                "embedded": emb is not None, "pinned": pin}
+                "embedded": emb is not None, "pinned": pin or constraint,
+                "constraint": constraint}
 
     async def correct_fact(self, old_node_id: str, new_content: str, *,
                           new_confidence: float = 0.9,
@@ -167,7 +278,7 @@ class MemoryTools:
         SQL path when SQLite has math functions; Python fallback otherwise.
         """
         now = int(time.time())
-        thr = 0.3
+        thr = WEAK_THRESHOLD
         if self._s.db.has_math_functions:
             async with self._s.db.get_read_connection().execute("""
                     SELECT id, type, content, eff FROM (

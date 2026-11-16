@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _ENV_FILE = Path(__file__).resolve().parent.parent.parent / ".env"
-
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -20,9 +20,16 @@ class Settings(BaseSettings):
     db_path: Path | None = None
     log_path: Path | None = None
 
+    # --- Transport ---
+    transport: Literal["stdio", "http"] = "stdio"
+    http_host: str = "127.0.0.1"
+    http_port: int = Field(default=8090, ge=1, le=65535)
+    http_path: str = "/mcp"
+    http_token: str | None = None
+
     # --- LLM / embedding endpoints ---
     llm_api_url: str = "http://127.0.0.1:9931"
-    llm_model: str = "MiniCPM-V-4.7-35B-A3B-Q4"
+    llm_model: str = "gemma-4-E4B-it-qat-UD-Q4_K_XL"
     llm_timeout: float = Field(default=60.0, gt=0)
     llm_max_tokens: int = Field(default=2048, ge=64)
     embedding_api_url: str = "http://127.0.0.1:8081"
@@ -45,6 +52,7 @@ class Settings(BaseSettings):
     episode_retention_days: int = Field(default=0, ge=0)
     soft_delete_retention_days: int = Field(default=30, ge=1)  # audit grace period
     max_episode_chars: int = Field(default=4000, ge=100)
+    consolidate_assistant: bool = False
 
     default_decay_rate: float = Field(default=0.1, ge=0.0, le=1.0)
     decay_threshold: float = Field(default=0.05, gt=0.0, lt=1.0)
@@ -56,15 +64,14 @@ class Settings(BaseSettings):
     rrf_weight_vec: float = Field(default=1.0, ge=0.0)
     rrf_weight_graph: float = Field(default=1.0, ge=0.0)
     max_search_limit: int = Field(default=50, ge=1, le=200)
+    dedup_similarity_threshold: float = Field(default=0.92, gt=0.0, lt=1.0)
 
     # --- Retrieval / dedup ---
-    dedup_similarity_threshold: float = Field(default=0.92, gt=0.0, lt=1.0)
     dedup_knn_k: int = Field(default=512, ge=1, le=10000)  # overfetch: episodes share vec_nodes
     vec_overfetch: int = Field(default=8, ge=1, le=100)    # search KNN: k = knn_k * overfetch
     dedup_sweep_limit: int = Field(default=200, ge=0)      # nightly retro-dedup, 0 = off
     entity_match_threshold: float = Field(default=0.90, gt=0.0, lt=1.0)
     entity_knn_k: int = Field(default=5, ge=1, le=50)
-    consolidate_assistant: bool = False
 
     log_level: str = "INFO"
     log_to_file: bool = False
@@ -81,6 +88,5 @@ class Settings(BaseSettings):
     @classmethod
     def _upper(cls, v: str) -> str:
         return v.upper()
-
 
 settings = Settings()

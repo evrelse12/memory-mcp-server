@@ -367,6 +367,35 @@ class Storage:
             rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
+    async def fetch_directives(self, limit: int = 50) -> list[dict]:
+        """Hard constraints (metadata.kind) + pinned opinions. Constraints first."""
+        async with self._read.execute("""
+                SELECT id, type, content, metadata FROM nodes
+                WHERE valid_until IS NULL
+                  AND ((type = 'opinion' AND decay_rate = 0.0)
+                       OR json_extract(metadata, '$.kind') = 'constraint')
+                ORDER BY CASE WHEN json_extract(metadata, '$.kind') = 'constraint'
+                              THEN 0 ELSE 1 END, event_time DESC
+                LIMIT ?""", (limit,)) as cur:
+            rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            meta = json.loads(r["metadata"] or "{}")
+            out.append({"id": r["id"], "type": r["type"],
+                        "kind": ("constraint" if meta.get("kind") == "constraint"
+                                 else "preference"),
+                        "content": r["content"]})
+        return out
+
+    async def fetch_profile(self, limit: int = 10) -> list[dict]:
+        """Pinned semantic facts: the stable user profile."""
+        async with self._read.execute("""
+                SELECT id, type, content FROM nodes
+                WHERE valid_until IS NULL AND type = 'semantic' AND decay_rate = 0.0
+                ORDER BY event_time DESC LIMIT ?""", (limit,)) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
     async def fetch_episodes(self, *, entity_id: str | None = None,
                              time_from: int | None = None,
                              time_to: int | None = None,

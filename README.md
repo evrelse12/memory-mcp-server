@@ -119,6 +119,23 @@ type filter runs after KNN and episodes share the vector table. FTS handles
 Russian via stop-words + crude prefix stemming; English via porter. Top-3 hits
 are reinforced in the background (never blocks the read).
 
+## Resources
+
+Read-only context endpoints. Hosts decide whether to inject them — MCP resources
+are application-driven, so they are a convenience, **not a guarantee**.
+`get_turn_context` plus the reference system prompt remain the reliable path.
+
+| URI | Content | priority |
+|---|---|---|
+| `memory://user/profile` | pinned semantic facts | 1.0 |
+| `memory://user/constraints` | hard rules (`constraint=true`) | 1.0 |
+| `memory://user/preferences` | pinned opinions | 0.8 |
+| `memory://session/{session_id}/summary` | extractive session digest | 0.6 |
+| `memory://entities/{entity_id}` | entity profile + linked facts | 0.5 |
+| `memory://episodes/recent` | last dialogue episodes | 0.3 |
+
+All are `text/markdown`, audience `assistant`. Digests are extractive (no LLM call).
+
 ## Tools
 
 | Tool | Purpose |
@@ -160,11 +177,32 @@ cp .env.example .env   # adjust URLs and models
 "memory": {
   "command": "<project>/venv/bin/python3",
   "args": ["<project>/main.py"],
-  "env": { "FASTMCP_CHECK_FOR_UPDATES": "false" }
+  "env": { "FASTMCP_CHECK_FOR_UPDATES": "off" }
 }
 ```
 
 Or, inside the venv: `memory-mcp`. No systemd unit, crontab or HTTP daemon needed.
+
+### Troubleshooting: client reports 0 tools
+
+The MCP client usually hides the child's stderr. Run the server the same way the
+client does and read the real error:
+
+```bash
+./venv/bin/python main.py < /dev/null
+```
+
+Common causes: a bad env var in the client's MCP config (FastMCP 4.x wants
+`FASTMCP_CHECK_FOR_UPDATES=off`, not `false`), or the startup fail-fast on
+`embedding_model`/`embedding_dim` mismatch — env from the client config
+overrides `.env`.
+
+## Run (HTTP, multi-client)
+
+Opt-in shared server for several clients. Set `MEMORY_TRANSPORT=http` (+
+`MEMORY_HTTP_HOST/PORT/PATH/TOKEN`) and run `memory-mcp`; endpoint
+`http://127.0.0.1:8090/mcp`, bearer-token auth. See [docs/HTTP.md](docs/HTTP.md)
+for security, client config, systemd and the multi-client/llama-server notes.
 
 ## Configuration
 
@@ -201,6 +239,11 @@ All vars use the `MEMORY_` prefix (see `.env.example`). Defaults:
 | `MAX_SEARCH_LIMIT` | 50 | |
 | `LOG_LEVEL` | INFO | |
 | `LOG_TO_FILE` | false | opt-in rotating file log (5 MB × 3) |
+| `TRANSPORT` | (stdio) || 
+| `HTTP_HOST` | (127.0.0.1) ||
+| `HTTP_PORT` | (8090) ||
+| `HTTP_PATH` | (/mcp) ||
+| 'HTTP_TOKEN` | (—) ||
 
 ## Tests
 
