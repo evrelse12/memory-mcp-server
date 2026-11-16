@@ -78,6 +78,8 @@ class Settings(BaseSettings):
 
     # --- NLI settings ---
     nli_model_dir: Path | None = None
+    nli_model_repo: str = "MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli"
+    nli_model_file: str = "onnx/model.onnx"
     nli_top_k: int = Field(default=3, ge=1, le=10)
     nli_reject_threshold: float = Field(default=-0.5, ge=-1.0, le=0.0)
     nli_promote_threshold: float = Field(default=0.6, ge=0.0, le=1.0)

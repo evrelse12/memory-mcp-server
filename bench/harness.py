@@ -361,7 +361,7 @@ async def run_all(items, cfg: Config, run_dir: Path) -> list[Result]:
         emb = EmbeddingService()
         try:
             await emb.embed_query("ping")
-            print(f"embeddings: OK ({settings.embedding_api_url})", flush=True)
+            print(f"embeddings: OK (backend={settings.embedding_backend})", flush=True)
         except EmbeddingError:
             print("embeddings: UNAVAILABLE — running FTS-only", flush=True)
         finally:

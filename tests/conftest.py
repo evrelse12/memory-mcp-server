@@ -20,7 +20,6 @@ os.environ["MEMORY_LOG_LEVEL"] = "WARNING"
 def anyio_backend():
     return "asyncio"
 
-
 @pytest.fixture
 def fresh_db(tmp_path, monkeypatch):
     """Each test gets its own database directory; no shared state between tests."""
@@ -30,3 +29,13 @@ def fresh_db(tmp_path, monkeypatch):
     (tmp_path / "db").mkdir(parents=True, exist_ok=True)
     (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
     return tmp_path
+
+@pytest.fixture(autouse=True)
+def _no_catchup_maintenance(monkeypatch):
+    """Tests must not spawn background nightly (network NLI download + races)."""
+    from memory_mcp.agents.maintenance import MaintenanceService
+
+    async def _noop(self):
+        return None
+
+    monkeypatch.setattr(MaintenanceService, "run_if_overdue", _noop)

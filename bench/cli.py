@@ -96,8 +96,11 @@ def main() -> int:
         "fts_only": args.fts_only,
         "baseline": cfg.baseline,
         "llm_model": settings.llm_model,
-        "embedding_model": settings.embedding_model,
         "embedding_backend": settings.embedding_backend,
+        "embedding_dim": settings.embedding_dim,
+        "embedding_model": (settings.onnx_embedding_model
+                            if settings.embedding_backend == "onnx"
+                            else settings.embedding_model),
         "max_sessions": cfg.max_sessions,
         "max_turns": cfg.max_turns,
     }
