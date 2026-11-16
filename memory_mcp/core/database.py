@@ -13,8 +13,7 @@ from memory_mcp.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
-
+SCHEMA_VERSION = 4
 
 class Database:
     def __init__(self, db_path: Path | None = None):
@@ -35,14 +34,17 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._write = await aiosqlite.connect(self.db_path, isolation_level=None)
         self._write.row_factory = aiosqlite.Row
-        self._read = await aiosqlite.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
+        self._read = await aiosqlite.connect(
+            f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
         self._read.row_factory = aiosqlite.Row
         await self._load_vec()
         await self._guard_schema_version()
         await self._create_schema()
+        await self._migrate()
         await self._apply_pragmas()
-        await self._check_embedding_meta()  # AFTER _apply_pragmas, OUTSIDE it
-        logger.info("Database initialized: %s (schema v%d)", self.db_path, SCHEMA_VERSION)
+        await self._check_embedding_meta()   # AFTER _apply_pragmas, OUTSIDE it
+        logger.info("Database initialized: %s (schema v%d)",
+                    self.db_path, SCHEMA_VERSION)
 
     async def _load_vec(self) -> None:
         """Load sqlite-vec extension into BOTH connections."""
@@ -54,25 +56,25 @@ class Database:
         logger.info("sqlite-vec loaded into both connections: %s", ext_path)
 
     async def _guard_schema_version(self) -> None:
-        """Fail fast on an old DB instead of silently opening incompatible tables."""
+        """Fail fast on a NEWER DB; older versions are upgraded by _migrate()."""
         async with self._write.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'"
-        ) as cur:
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='nodes'") as cur:
             has_nodes = await cur.fetchone() is not None
         async with self._write.execute("PRAGMA user_version") as cur:
             row = await cur.fetchone()
         version = row[0] if row else 0
-        if has_nodes and version != SCHEMA_VERSION:
+        if has_nodes and version > SCHEMA_VERSION:
             await self._write.close()
             await self._read.close()
             raise RuntimeError(
-                f"incompatible schema v{version} (expected v{SCHEMA_VERSION}); "
-                f"back up the DB and migrate manually (no auto-migrations yet)"
-            )
+                f"incompatible schema v{version} (expected v{SCHEMA_VERSION} "
+                f"or older); downgrade not supported, use an older code version")
 
     async def _create_schema(self) -> None:
         w = self._write
-        async with w.execute("SELECT name FROM sqlite_master WHERE type='table'") as cur:
+        async with w.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'") as cur:
             existing = {r[0] for r in await cur.fetchall()}
 
         if "nodes" not in existing:
@@ -94,7 +96,11 @@ class Database:
                     decay_rate REAL NOT NULL DEFAULT 0.1,
                     needs_embedding INTEGER NOT NULL DEFAULT 0,
                     valid_until INTEGER,
-                    metadata TEXT NOT NULL DEFAULT '{}'
+                    metadata TEXT NOT NULL DEFAULT '{}',
+                    status TEXT DEFAULT 'canonical',
+                    nli_score REAL,
+                    generator_model TEXT,
+                    critic_model TEXT
                 )
             """):
                 pass
@@ -158,6 +164,11 @@ class Database:
             """):
                 pass
 
+            # Fresh DB: stamp the version here. Existing DBs keep their old
+            # version so _migrate() can see what still needs to be applied.
+            async with w.execute(f"PRAGMA user_version = {SCHEMA_VERSION}"):
+                pass
+
         # FTS5 virtual table: rowid joins against nodes.rid
         async with w.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts
@@ -204,14 +215,22 @@ class Database:
 
         # Indexes (idempotent)
         for idx in (
-            "CREATE INDEX IF NOT EXISTS idx_nodes_type_valid ON nodes(type, valid_until)",
-            "CREATE INDEX IF NOT EXISTS idx_nodes_session ON nodes(session_id, event_time)",
-            "CREATE INDEX IF NOT EXISTS idx_nodes_event_time ON nodes(event_time)",
-            "CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation_type, valid_until)",
-            "CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, valid_until)",
-            "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, valid_until)",
-            "CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)",
-            "CREATE INDEX IF NOT EXISTS idx_node_entities_entity ON node_entities(entity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_nodes_type_valid "
+            "ON nodes(type, valid_until)",
+            "CREATE INDEX IF NOT EXISTS idx_nodes_session "
+            "ON nodes(session_id, event_time)",
+            "CREATE INDEX IF NOT EXISTS idx_nodes_event_time "
+            "ON nodes(event_time)",
+            "CREATE INDEX IF NOT EXISTS idx_edges_relation "
+            "ON edges(relation_type, valid_until)",
+            "CREATE INDEX IF NOT EXISTS idx_edges_source "
+            "ON edges(source_id, valid_until)",
+            "CREATE INDEX IF NOT EXISTS idx_edges_target "
+            "ON edges(target_id, valid_until)",
+            "CREATE INDEX IF NOT EXISTS idx_entities_type "
+            "ON entities(type)",
+            "CREATE INDEX IF NOT EXISTS idx_node_entities_entity "
+            "ON node_entities(entity_id)",
             # unique triple for ON CONFLICT DO NOTHING to actually dedupe edges
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_triple "
             "ON edges(source_id, target_id, relation_type)",
@@ -219,8 +238,41 @@ class Database:
             async with w.execute(idx):
                 pass
 
-        async with w.execute(f"PRAGMA user_version = {SCHEMA_VERSION}"):
+    async def _migrate(self) -> None:
+        """Apply schema migrations on a live DB (any older version -> current)."""
+        async with self._write.execute("PRAGMA user_version") as cur:
+            row = await cur.fetchone()
+        version = row[0] if row else 0
+        if version >= SCHEMA_VERSION:
+            return
+        logger.info("Migrating schema v%d -> v%d", version, SCHEMA_VERSION)
+
+        if version < 4:
+            # v4: Consolidation & Reflection fields on nodes.
+            cols = await self._column_names("nodes")
+            for col, defn in (
+                ("status", "TEXT DEFAULT 'canonical'"),
+                ("nli_score", "REAL"),
+                ("generator_model", "TEXT"),
+                ("critic_model", "TEXT"),
+            ):
+                if col not in cols:
+                    async with self._write.execute(
+                            f"ALTER TABLE nodes ADD COLUMN {col} {defn}"):
+                        pass
+            async with self._write.execute(
+                    "UPDATE nodes SET status='canonical' "
+                    "WHERE status IS NULL OR status=''"):
+                pass
+
+        async with self._write.execute(f"PRAGMA user_version = {SCHEMA_VERSION}"):
             pass
+
+    async def _column_names(self, table: str) -> list[str]:
+        """Column names of a table (read connection)."""
+        async with self._read.execute(f"PRAGMA table_info({table})") as cur:
+            rows = await cur.fetchall()
+        return [r["name"] for r in rows]
 
     async def _apply_pragmas(self) -> None:
         w = self._write
@@ -232,14 +284,12 @@ class Database:
         except aiosqlite.OperationalError:
             self.has_math_functions = False
 
-        for p in (
-            "PRAGMA journal_mode=WAL",
-            "PRAGMA synchronous=NORMAL",
-            "PRAGMA foreign_keys=ON",
-            "PRAGMA temp_store=MEMORY",
-            "PRAGMA cache_size=-20000",
-            "PRAGMA busy_timeout=5000",
-        ):
+        for p in ("PRAGMA journal_mode=WAL",
+                  "PRAGMA synchronous=NORMAL",
+                  "PRAGMA foreign_keys=ON",
+                  "PRAGMA temp_store=MEMORY",
+                  "PRAGMA cache_size=-20000",
+                  "PRAGMA busy_timeout=5000"):
             async with w.execute(p) as cur:
                 await cur.fetchone()
         logger.info("Pragmas applied (math_functions=%s)", self.has_math_functions)
@@ -247,13 +297,13 @@ class Database:
     async def _check_embedding_meta(self) -> None:
         """Fail fast when embedding model or dim changed since DB creation."""
         async with self._write.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
-        ) as cur:
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='meta'") as cur:
             if await cur.fetchone() is None:
                 return
         async with self._write.execute(
-            "SELECT key, value FROM meta WHERE key IN ('embedding_dim','embedding_model')"
-        ) as cur:
+                "SELECT key, value FROM meta "
+                "WHERE key IN ('embedding_dim','embedding_model')") as cur:
             stored = {r["key"]: r["value"] for r in await cur.fetchall()}
 
         dim = stored.get("embedding_dim")
@@ -262,28 +312,24 @@ class Database:
             raise RuntimeError(
                 f"embedding_dim mismatch: DB has {dim}, config wants "
                 f"{settings.embedding_dim}. Set MEMORY_EMBEDDING_DIM={dim} "
-                f"or migrate."
-            )
+                f"or migrate.")
         model = stored.get("embedding_model")
         if model is not None and model != settings.embedding_model:
             await self._close_both()
             raise RuntimeError(
                 f"embedding_model mismatch: DB has {model!r}, config wants "
                 f"{settings.embedding_model!r}. Vectors are not comparable "
-                f"across models; migrate or set MEMORY_EMBEDDING_MODEL={model}."
-            )
+                f"across models; migrate or set MEMORY_EMBEDDING_MODEL={model}.")
 
         # isolation_level=None -> autocommit; no WriteQueue needed here
         await self._write.execute(
             "INSERT INTO meta(key, value) VALUES (?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            ("embedding_dim", str(settings.embedding_dim)),
-        )
+            ("embedding_dim", str(settings.embedding_dim)))
         await self._write.execute(
             "INSERT INTO meta(key, value) VALUES (?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            ("embedding_model", settings.embedding_model),
-        )
+            ("embedding_model", settings.embedding_model))
 
     async def _close_both(self) -> None:
         for conn in (self._write, self._read):

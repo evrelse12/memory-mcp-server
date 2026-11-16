@@ -50,7 +50,6 @@ def patched_services(monkeypatch):
     monkeypatch.setattr(emb_mod.EmbeddingService, "_call_batch", _fake_call_batch)
     monkeypatch.setattr(emb_mod.EmbeddingService, "_call", _fake_call)
 
-
 @pytest.mark.asyncio
 async def test_consolidation_extracts_and_marks(fresh_db, patched_services):
     async with server.lifespan(server.mcp):
@@ -66,9 +65,17 @@ async def test_consolidation_extracts_and_marks(fresh_db, patched_services):
         marked = await ctx.storage.session_consolidated_at("sX")
         assert marked is not None
 
-        facts = await ctx.tools.search_memory("Moscow", limit=5)
+        # Hypotheses are hidden by default; request them explicitly
+        facts = await ctx.tools.search_memory("Moscow", limit=5,
+                                              include_hypotheses=True)
         assert any("Moscow" in f["content"] for f in facts)
 
+        # Verify they're marked as hypotheses
+        async with ctx.storage.db.get_read_connection().execute(
+                "SELECT status FROM nodes WHERE type='semantic' AND content LIKE '%Moscow%'"
+        ) as cur:
+            rows = await cur.fetchall()
+        assert rows and rows[0]["status"] == "hypothesis"
 
 @pytest.mark.asyncio
 async def test_consolidation_retries_on_embedding_failure(fresh_db, monkeypatch):

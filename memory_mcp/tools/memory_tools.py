@@ -41,26 +41,32 @@ class MemoryTools:
         self._ei = entity_index
         self._decay = decay
 
-    async def search_memory(
-        self,
-        query: str,
-        *,
-        node_types=None,
-        time_from=None,
-        time_to=None,
-        limit: int = 10,
-        include_episodes: bool = False,
-    ) -> list[dict]:
-        return await self._search.search(
-            query,
-            limit=limit,
-            node_types=node_types,
-            time_from=time_from,
-            time_to=time_to,
-            include_episodes=include_episodes,
-        )
+    async def _canonical_ids(self, ids: list[str]) -> set[str]:
+        """Ids of nodes that are not unverified LLM hypotheses."""
+        if not ids:
+            return set()
+        qs = ",".join("?" * len(ids))
+        async with self._s.db.get_read_connection().execute(
+                f"SELECT id FROM nodes WHERE id IN ({qs}) "
+                f"AND (status IS NULL OR status != 'hypothesis')",
+                tuple(ids)) as cur:
+            return {r["id"] for r in await cur.fetchall()}
 
-    async def get_turn_context(self, user_message: str, *, limit: int = 8) -> dict:
+    async def search_memory(self, query: str, *, node_types=None,
+                            time_from=None, time_to=None,
+                            limit: int = 10,
+                            include_episodes: bool = False,
+                            include_hypotheses: bool = False) -> list[dict]:
+        hits = await self._search.search(
+            query, limit=limit, node_types=node_types,
+            time_from=time_from, time_to=time_to,
+            include_episodes=include_episodes)
+        if not include_hypotheses:
+            keep = await self._canonical_ids([h["id"] for h in hits])
+            hits = [h for h in hits if h["id"] in keep]
+        return hits
+
+    async def get_turn_context(self, user_message: str, *, limit: int = 8, include_hypotheses: bool = False) -> dict:
         """One-call turn context: directives + profile + relevant facts.
 
         Returns a ready-to-read <user_memory> block plus structured parts.
@@ -70,6 +76,9 @@ class MemoryTools:
         directives = await self._s.fetch_directives(DIRECTIVES_LIMIT)
         profile = await self._s.fetch_profile(PROFILE_LIMIT)
         hits = await self._search.search(user_message, limit=limit)
+        if not include_hypotheses:
+            keep = await self._canonical_ids([h["id"] for h in hits])
+            hits = [h for h in hits if h["id"] in keep]
         seen = {d["id"] for d in directives} | {p["id"] for p in profile}
         facts = [h for h in hits if h["id"] not in seen and h["confidence"] >= WEAK_THRESHOLD]
 

@@ -148,6 +148,12 @@ class Consolidator:
             )
         return out
 
+    async def _mark_hypothesis(self, node_id: str) -> None:
+        """LLM-inferred facts start unverified; Reflection promotes/rejects."""
+        await self._s.execute(
+            "UPDATE nodes SET status='hypothesis', generator_model=? WHERE id=?",
+            (settings.llm_model, node_id), wait=True)
+
     async def _store(self, session_id, chunk, facts):
         if not facts:
             return
@@ -186,25 +192,16 @@ class Consolidator:
                 elif verdict == "same":
                     continue
                 elif verdict == "contradicts":
-                    await self._s.supersede_fact(
-                        existing["id"],
-                        node_type=existing["type"],
-                        content=fact["content"],
-                        confidence=fact["confidence"],
-                        embedding=emb,
-                        source_episode_ids=src_ids,
-                        entity_ids=eids,
-                    )
+                    nid = await self._s.supersede_fact(
+                        existing["id"], node_type=existing["type"],
+                        content=fact["content"], confidence=fact["confidence"],
+                        embedding=emb, source_episode_ids=src_ids, entity_ids=eids)
+                    await self._mark_hypothesis(nid)
                     continue
                 # "different" or inconclusive -> insert as a new fact
-                # "different" -> insert as a new fact
-            await self._s.create_fact(
-                content=fact["content"],
-                node_type=fact["type"],
-                confidence=fact["confidence"],
-                embedding=emb,
-                session_id=session_id,
-                event_time=event_time,
-                entity_ids=eids,
-                source_episode_ids=src_ids,
-            )
+            nid = await self._s.create_fact(
+                content=fact["content"], node_type=fact["type"],
+                confidence=fact["confidence"], embedding=emb,
+                session_id=session_id, event_time=event_time,
+                entity_ids=eids, source_episode_ids=src_ids)
+            await self._mark_hypothesis(nid)
