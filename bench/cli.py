@@ -97,6 +97,7 @@ def main() -> int:
         "baseline": cfg.baseline,
         "llm_model": settings.llm_model,
         "embedding_model": settings.embedding_model,
+        "embedding_backend": settings.embedding_backend,
         "max_sessions": cfg.max_sessions,
         "max_turns": cfg.max_turns,
     }
