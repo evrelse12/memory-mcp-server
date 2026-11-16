@@ -17,6 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+onnx = [
+    "onnxruntime>=1.17",
+    "transformers>=4.40",
+    "huggingface_hub>=0.23",
+    "numpy>=1.26",
+]
 
 [project.scripts]
 memory-mcp = "memory_mcp.mcp_server.server:main"

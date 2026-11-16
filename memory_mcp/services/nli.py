@@ -11,8 +11,6 @@ import logging
 from pathlib import Path
 from typing import Literal
 
-import numpy as np
-
 from memory_mcp.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -86,6 +84,7 @@ class NLIClassifier:
         """Score (premise, hypothesis) -> (label, confidence in [0,1])."""
         self._ensure_loaded()
         try:
+            import numpy as np
             inputs = self._tokenizer(
                 premise, hypothesis, return_tensors="np",
                 truncation=True, max_length=512, padding=True)
