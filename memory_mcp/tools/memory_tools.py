@@ -48,7 +48,7 @@ class MemoryTools:
         qs = ",".join("?" * len(ids))
         async with self._s.db.get_read_connection().execute(
                 f"SELECT id FROM nodes WHERE id IN ({qs}) "
-                f"AND (status IS NULL OR status != 'hypothesis')",
+                f"AND (status IS NULL OR status='canonical')",
                 tuple(ids)) as cur:
             return {r["id"] for r in await cur.fetchall()}
 

@@ -20,6 +20,18 @@ logger = logging.getLogger(__name__)
 
 OVERDUE_S = 20 * 3600
 
+CRITIC_PROMPT = """You are an adversarial memory verifier. Presume the hypothesis is WRONG until proven.
+Find contradictions, logical gaps and unsupported generalizations.
+Hypothesis: {hypothesis}
+NLI score (entailment minus contradiction, -1..1): {nli}
+Source episodes (the ONLY admissible evidence):
+{sources}
+Related existing facts (context, not evidence):
+{neighbors}
+Return ONLY valid JSON: {{"approve": bool, "reason": string, "evidence_ids": [ids]}}
+Approve ONLY if the hypothesis is directly supported by the source episodes and you cite
+their ids in evidence_ids. If unsupported, contradicted or an over-generalization, set
+approve=false. Never approve without evidence_ids drawn from the source episodes."""
 
 class MaintenanceService:
     def __init__(
@@ -59,6 +71,7 @@ class MaintenanceService:
                 ("enrich", self._enrich_entities),
                 ("housekeep", self._housekeep),
                 ("nli_shadow", self._run_nli_shadow),
+                ("critic", self._run_critic),
             )
             for name, step in steps:
                 try:
@@ -160,6 +173,69 @@ class MaintenanceService:
         finally:
             nli.unload()
         return {"scored": scored, "total": len(hyps)}
+    @staticmethod
+    def _validate_verdict(v, source_ids: set) -> str | None:
+        """approve requires cited evidence from the grounding set; else reject/inconclusive."""
+        if not isinstance(v, dict) or not isinstance(v.get("approve"), bool):
+            return None
+        if not v["approve"]:
+            return "reject"
+        ev = v.get("evidence_ids") or []
+        if not ev or not set(ev) <= source_ids:
+            return None
+        return "approve"
+
+    async def _run_critic(self, now: int) -> dict:
+        """Adversarial LLM verification of hypotheses; promote/reject with provenance."""
+        async with self._s.db.get_read_connection().execute(
+                "SELECT id, content, nli_score FROM nodes WHERE status='hypothesis'"
+        ) as cur:
+            hyps = await cur.fetchall()
+        if not hyps:
+            return {"approved": 0, "rejected": 0, "pending": 0, "approval_rate": None}
+
+        approved = rejected = pending = 0
+        for h in hyps:
+            sources, _, _ = await self._s.provenance(h["id"])
+            if not sources:
+                pending += 1
+                continue
+            eps = sources[: settings.nli_top_k]
+            neighbors = [n for n in await self._search.search(h["content"], limit=3)
+                         if n["id"] != h["id"]][:3]
+            prompt = CRITIC_PROMPT.format(
+                hypothesis=h["content"],
+                nli=h["nli_score"] if h["nli_score"] is not None else "n/a",
+                sources="\n".join(f"- [{e['id']}] {e['content'][:300]}" for e in eps),
+                neighbors="\n".join(f"- {n['content'][:200]}" for n in neighbors) or "(none)",
+            )
+            try:
+                verdict = await self._c.llm.chat_json(
+                    [{"role": "user", "content": prompt}],
+                    max_tokens=256, temperature=0.0)
+            except LLMError:
+                pending += 1
+                continue
+            decision = self._validate_verdict(verdict, {e["id"] for e in eps})
+            if decision == "approve":
+                await self._s.execute(
+                    "UPDATE nodes SET status='canonical', critic_model=? WHERE id=?",
+                    (settings.llm_model, h["id"]), wait=True)
+                approved += 1
+            elif decision == "reject":
+                await self._s.execute(
+                    "UPDATE nodes SET status='rejected', critic_model=? WHERE id=?",
+                    (settings.llm_model, h["id"]), wait=True)
+                rejected += 1
+            else:
+                pending += 1
+
+        judged = approved + rejected
+        rate = round(approved / judged, 4) if judged else None
+        logger.info("critic: approved=%d rejected=%d pending=%d approval_rate=%s",
+                    approved, rejected, pending, rate)
+        return {"approved": approved, "rejected": rejected,
+                "pending": pending, "approval_rate": rate}
 
     async def _dedup_step(self, now: int) -> dict:
         return await self._search.sweep_duplicates()
