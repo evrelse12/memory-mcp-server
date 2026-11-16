@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # --- NLI settings ---
     nli_model_dir: Path | None = None
     nli_top_k: int = Field(default=3, ge=1, le=10)
+    nli_reject_threshold: float = Field(default=-0.5, ge=-1.0, le=0.0)
+    nli_promote_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    nli_auto_promote: bool = False
+    hypothesis_ttl_days: int = Field(default=7, ge=1)
 
     # --- Log level ---
     log_level: str = "INFO"

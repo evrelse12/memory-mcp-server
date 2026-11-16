@@ -71,6 +71,7 @@ class MaintenanceService:
                 ("enrich", self._enrich_entities),
                 ("housekeep", self._housekeep),
                 ("nli_shadow", self._run_nli_shadow),
+                ("regulate", self._regulate),
                 ("critic", self._run_critic),
             )
             for name, step in steps:
@@ -219,8 +220,10 @@ class MaintenanceService:
             decision = self._validate_verdict(verdict, {e["id"] for e in eps})
             if decision == "approve":
                 await self._s.execute(
-                    "UPDATE nodes SET status='canonical', critic_model=? WHERE id=?",
-                    (settings.llm_model, h["id"]), wait=True)
+                    "UPDATE nodes SET status='canonical', critic_model=?, confidence=? "
+                    "WHERE id=?",
+                    (settings.llm_model, self._calibrated_confidence(h["nli_score"]),
+                     h["id"]), wait=True)
                 approved += 1
             elif decision == "reject":
                 await self._s.execute(
@@ -236,6 +239,43 @@ class MaintenanceService:
                     approved, rejected, pending, rate)
         return {"approved": approved, "rejected": rejected,
                 "pending": pending, "approval_rate": rate}
+
+    @staticmethod
+    def _calibrated_confidence(nli_score: float | None) -> float:
+        """Map NLI entailment strength to a stored confidence in [0.6, 1.0]."""
+        base = nli_score if nli_score is not None else 0.5
+        return round(min(1.0, max(0.6, 0.6 + 0.4 * max(0.0, base))), 4)
+
+    async def _regulate(self, now: int) -> dict:
+        """Pure-code regulator: NLI gate + stale-hypothesis archival (no LLM)."""
+        gated_reject = gated_promote = archived = 0
+        async with self._s.db.get_read_connection().execute(
+                "SELECT id, nli_score, created_at FROM nodes WHERE status='hypothesis'"
+        ) as cur:
+            hyps = await cur.fetchall()
+        for h in hyps:
+            score = h["nli_score"]
+            if score is not None and score <= settings.nli_reject_threshold:
+                await self._s.execute(
+                    "UPDATE nodes SET status='rejected', critic_model='nli-gate' "
+                    "WHERE id=?", (h["id"],), wait=True)
+                gated_reject += 1
+                continue
+            if (settings.nli_auto_promote and score is not None
+                    and score >= settings.nli_promote_threshold):
+                await self._s.execute(
+                    "UPDATE nodes SET status='canonical', critic_model='nli-gate', "
+                    "confidence=? WHERE id=?",
+                    (self._calibrated_confidence(score), h["id"]), wait=True)
+                gated_promote += 1
+                continue
+            if now - h["created_at"] > settings.hypothesis_ttl_days * 86400:
+                await self._s.soft_delete_nodes([h["id"]])
+                archived += 1
+        logger.info("regulator: gated_reject=%d gated_promote=%d archived=%d",
+                    gated_reject, gated_promote, archived)
+        return {"gated_reject": gated_reject, "gated_promote": gated_promote,
+                "archived": archived}
 
     async def _dedup_step(self, now: int) -> dict:
         return await self._search.sweep_duplicates()
