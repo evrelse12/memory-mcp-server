@@ -58,6 +58,7 @@ class MaintenanceService:
                 ("decay", self._decay_step),
                 ("enrich", self._enrich_entities),
                 ("housekeep", self._housekeep),
+                ("nli_shadow", self._run_nli_shadow),
             )
             for name, step in steps:
                 try:
@@ -70,7 +71,8 @@ class MaintenanceService:
             return report
 
     async def run_consolidation_tick(self) -> None:
-        """Consolidate idle sessions periodically; full maintenance stays nightly."""
+        """Consolidate idlsteps = (
+                ("consolidate"e sessions periodically; full maintenance stays nightly."""
         if self._lock.locked():
             return
         async with self._lock:
@@ -107,6 +109,57 @@ class MaintenanceService:
             if await self._c.consolidate_session(sid, episodes=eps):
                 consolidated += 1
         return {"sessions": len(sids), "consolidated": consolidated}
+
+    async def _run_nli_shadow(self, now: int) -> dict:
+        """Score unverified hypotheses against their source episodes (shadow mode).
+
+        Grounding = the episodes the hypothesis was derived from (derived_from
+        edges), not "same session". Logs scores for threshold calibration;
+        does not promote/reject anything yet (Phase 4).
+        """
+        from memory_mcp.services.nli import NLIClassifier, NLIError
+
+        async with self._s.db.get_read_connection().execute(
+                "SELECT id, content, generator_model FROM nodes "
+                "WHERE status='hypothesis' AND nli_score IS NULL"
+        ) as cur:
+            hyps = await cur.fetchall()
+        if not hyps:
+            logger.info("NLI shadow: no new hypotheses to score")
+            return {"scored": 0, "total": 0}
+
+        nli = NLIClassifier(settings.nli_models_path)
+        scored = 0
+        try:
+            for h in hyps:
+                try:
+                    sources, _, _ = await self._s.provenance(h["id"])
+                    eps = sources[: settings.nli_top_k]
+                    if not eps:
+                        logger.debug("NLI shadow: no sources for %s", h["id"])
+                        continue
+
+                    max_entailment = 0.0
+                    max_contradiction = 0.0
+                    for ep in eps:
+                        label, conf = await nli.classify(ep["content"], h["content"])
+                        if label == "entailment":
+                            max_entailment = max(max_entailment, conf)
+                        elif label == "contradiction":
+                            max_contradiction = max(max_contradiction, conf)
+
+                    final_score = max_entailment - max_contradiction
+                    await self._s.execute(
+                        "UPDATE nodes SET nli_score=? WHERE id=?",
+                        (final_score, h["id"]), wait=True)
+                    scored += 1
+                except NLIError as e:
+                    logger.warning("NLI failed for hypothesis %s: %s", h["id"], e)
+                    break
+            logger.info("NLI shadow: scored %d/%d hypotheses", scored, len(hyps))
+        finally:
+            nli.unload()
+        return {"scored": scored, "total": len(hyps)}
 
     async def _dedup_step(self, now: int) -> dict:
         return await self._search.sweep_duplicates()

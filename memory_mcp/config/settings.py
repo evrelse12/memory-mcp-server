@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     entity_match_threshold: float = Field(default=0.90, gt=0.0, lt=1.0)
     entity_knn_k: int = Field(default=5, ge=1, le=50)
 
+    # --- NLI settings ---
+    nli_model_dir: Path | None = None
+    nli_top_k: int = Field(default=3, ge=1, le=10)
+
+    # --- Log level ---
     log_level: str = "INFO"
     log_to_file: bool = False
 
@@ -83,6 +88,10 @@ class Settings(BaseSettings):
     @property
     def log_file(self) -> Path:
         return self.log_path or (self.data_dir / "logs" / "memory.log")
+
+    @property
+    def nli_models_path(self) -> Path:
+        return self.nli_model_dir or (self.data_dir / "models" / "nli")
 
     @field_validator("log_level")
     @classmethod
