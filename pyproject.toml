@@ -1,6 +1,6 @@
 [project]
 name = "memory-mcp"
-version = "0.7.0"
+version = "0.8.0"
 description = "Long-term memory MCP server: knowledge graph, hybrid search, Ebbinghaus decay"
 readme = "README.md"
 requires-python = ">=3.10"
