@@ -216,9 +216,8 @@ async def _answer(llm, question: str, context: str, arm: str) -> tuple[str, floa
     )
     t0 = time.perf_counter()
     try:
-        text = await llm.chat(
-            [{"role": "user", "content": prompt}], max_tokens=128, temperature=0.0
-        )
+        text = await llm.chat([{"role": "user", "content": prompt}],
+                              max_tokens=512, temperature=0.0)
     except LLMError as e:
         return "", (time.perf_counter() - t0) * 1000, f"answer: {e}"
     return text, (time.perf_counter() - t0) * 1000, None

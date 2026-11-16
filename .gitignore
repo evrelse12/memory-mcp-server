@@ -28,3 +28,9 @@ bench/results/
 bench/.cache/
 bench/*.json
 bench/data/
+models/
+*.onnx
+*.gguf
+*.safetensors
+*.bin
+.cache/

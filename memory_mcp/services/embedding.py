@@ -43,7 +43,7 @@ class OnnxEmbedder:
         import onnxruntime as ort
         from huggingface_hub import hf_hub_download
         from transformers import AutoTokenizer
-        path = hf_hub_download(repo_id=self._ref, filename="model.onnx")
+        path = hf_hub_download(repo_id=self._ref, filename=settings.onnx_embedding_file)
         self._sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
         self._tok = AutoTokenizer.from_pretrained(self._ref)
 
@@ -55,8 +55,12 @@ class OnnxEmbedder:
         names = {i.name for i in self._sess.get_inputs()}
         if "token_type_ids" in enc and "token_type_ids" in names:
             feeds["token_type_ids"] = enc["token_type_ids"]
-        hidden = self._sess.run(None, feeds)[0]   # last_hidden_state
-        return hidden[:, 0, :].tolist()           # CLS pooling
+        out = self._sess.run(None, feeds)[0]
+        import numpy as np
+        arr = np.asarray(out)
+        if arr.ndim == 3:            # last_hidden_state -> CLS pooling
+            arr = arr[:, 0, :]
+        return arr.tolist()          # 2D = already pooled sentence embedding
 
 
 _ONNX_SINGLETON: OnnxEmbedder | None = None

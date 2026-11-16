@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     embedding_truncate_matryoshka: bool = True
     embedding_backend: Literal["http", "onnx"] = "http"
     onnx_embedding_model: str = "gpahal/bge-m3-onnx-int8"
+    onnx_embedding_file: str = "model_quantized.onnx"
 
     # --- Memory behaviour ---
     session_timeout_minutes: int = Field(default=30, ge=1)
